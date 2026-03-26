@@ -127,9 +127,17 @@ class OmadaClient:
         """Build a site-level API path."""
         return f"/{self._omadac_id}/api/v2/sites/{self._site_id}/{endpoint}"
 
-    async def _get(self, path: str, params: dict | None = None) -> Any:
-        """GET request with auth, error handling, and session recovery."""
+    async def _get(self, path: str | Any, params: dict | None = None) -> Any:
+        """GET request with auth, error handling, and session recovery.
+
+        *path* may be a plain string **or** a zero-argument callable that
+        returns a string.  Passing a callable defers path construction until
+        after authentication so that ``_omadac_id`` and ``_site_id`` are
+        already populated when the path is built.
+        """
         await self._ensure_auth()
+        if callable(path):
+            path = path()
         resp = await self._http.get(path, params=params)
         self._raise_for_status(resp)
 
@@ -169,58 +177,58 @@ class OmadaClient:
     # ── Controller-level endpoints ───────────────────────────────────
 
     async def get_controller_status(self) -> dict:
-        return await self._get(self._controller_path("settings/system/status"))
+        return await self._get(lambda: self._controller_path("settings/system/status"))
 
     async def get_sites(self) -> dict:
         return await self._get(
-            self._controller_path("sites/basic"),
+            lambda: self._controller_path("sites/basic"),
             params={"currentPageSize": 100, "currentPage": 1},
         )
 
     async def get_capabilities(self) -> list:
-        return await self._get(self._controller_path("capabilities"))
+        return await self._get(lambda: self._controller_path("capabilities"))
 
     async def get_user_detail(self) -> dict:
-        return await self._get(self._controller_path("current/user-detail"))
+        return await self._get(lambda: self._controller_path("current/user-detail"))
 
     async def get_alert_count(self) -> dict:
-        return await self._get(self._controller_path("alerts/num"))
+        return await self._get(lambda: self._controller_path("alerts/num"))
 
     # ── Site-level endpoints ─────────────────────────────────────────
 
     async def get_dashboard_overview(self) -> dict:
-        return await self._get(self._site_path("dashboard/overviewDiagram"))
+        return await self._get(lambda: self._site_path("dashboard/overviewDiagram"))
 
     async def get_wifi_channels(self) -> dict:
-        return await self._get(self._site_path("dashboard/channels"))
+        return await self._get(lambda: self._site_path("dashboard/channels"))
 
     async def get_devices(self, page: int = 1, page_size: int = 100) -> dict:
         return await self._get(
-            self._site_path("grid/devices"),
+            lambda: self._site_path("grid/devices"),
             params={"currentPage": page, "currentPageSize": page_size},
         )
 
     async def get_active_clients(self, page: int = 1, page_size: int = 100) -> dict:
         return await self._get(
-            self._site_path("clients"),
+            lambda: self._site_path("clients"),
             params={"filters.active": "true", "currentPage": page, "currentPageSize": page_size},
         )
 
     async def get_known_clients(self, page: int = 1, page_size: int = 100) -> dict:
         return await self._get(
-            self._site_path("insight/clients"),
+            lambda: self._site_path("insight/clients"),
             params={"currentPage": page, "currentPageSize": page_size},
         )
 
     async def get_wlans(self) -> dict:
-        return await self._get(self._site_path("setting/wlans"))
+        return await self._get(lambda: self._site_path("setting/wlans"))
 
     async def get_ssids(self) -> dict:
-        return await self._get(self._site_path("setting/ssids"))
+        return await self._get(lambda: self._site_path("setting/ssids"))
 
     async def get_lan_networks(self, page: int = 1, page_size: int = 100) -> dict:
         return await self._get(
-            self._site_path("setting/lan/networks"),
+            lambda: self._site_path("setting/lan/networks"),
             params={"currentPage": page, "currentPageSize": page_size},
         )
 
@@ -228,7 +236,7 @@ class OmadaClient:
         now_ms = int(time.time() * 1000)
         thirty_days_ms = 30 * 24 * 60 * 60 * 1000
         return await self._get(
-            self._site_path("logs/alerts"),
+            lambda: self._site_path("logs/alerts"),
             params={
                 "filters.resolved": str(resolved).lower(),
                 "filters.timeStart": now_ms - thirty_days_ms,
