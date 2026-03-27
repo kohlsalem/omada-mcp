@@ -42,19 +42,19 @@ class TestLiveController:
 
     async def test_get_devices(self, client):
         devices = await client.get_devices()
-        dev_list = devices.get("data", []) if isinstance(devices, dict) else devices
-        assert len(dev_list) > 0
-        print(f"  Devices: {[d['name'] for d in dev_list]}")
+        assert isinstance(devices, list)
+        assert len(devices) > 0
+        print(f"  Devices: {[d['name'] for d in devices]}")
 
     async def test_get_active_clients(self, client):
         clients = await client.get_active_clients()
-        assert "data" in clients
-        print(f"  Active clients: {clients['totalRows']}")
+        assert isinstance(clients, list)
+        print(f"  Active clients: {len(clients)}")
 
     async def test_get_known_clients(self, client):
         clients = await client.get_known_clients()
-        assert "data" in clients
-        print(f"  Known clients: {clients['totalRows']}")
+        assert isinstance(clients, list)
+        print(f"  Known clients: {len(clients)}")
 
     async def test_get_dashboard_overview(self, client):
         overview = await client.get_dashboard_overview()
@@ -74,8 +74,8 @@ class TestLiveController:
 
     async def test_get_lan_networks(self, client):
         networks = await client.get_lan_networks()
-        assert "data" in networks
-        print(f"  LAN networks: {[n['name'] for n in networks['data']]}")
+        assert isinstance(networks, list)
+        print(f"  LAN networks: {[n['name'] for n in networks]}")
 
     async def test_get_wlans(self, client):
         wlans = await client.get_wlans()
@@ -91,3 +91,13 @@ class TestLiveController:
         user = await client.get_user_detail()
         assert "name" in user
         print(f"  User: {user['name']} ({user['roleName']})")
+
+    async def test_check_connection(self, client):
+        result = await client.check_connection()
+        assert result["connected"] is True
+        print(f"  Controller: {result['controller']} v{result['version']}")
+
+    async def test_get_alerts(self, client):
+        alerts = await client.get_alerts()
+        assert isinstance(alerts, list)
+        print(f"  Alerts: {len(alerts)}")
