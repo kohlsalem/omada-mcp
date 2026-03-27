@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "omada": {
+      "command": "/Users/D054904/kohlsalem/omada-mcp/.venv/bin/omada-mcp"
+    }
+  }
+}

@@ -2,6 +2,7 @@
 
 import logging
 import sys
+from contextlib import asynccontextmanager
 
 from mcp.server.fastmcp import FastMCP
 
@@ -11,15 +12,6 @@ from omada_mcp.client import OmadaClient
 logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("omada-mcp")
 
-mcp = FastMCP(
-    "omada",
-    instructions=(
-        "MCP server for TP-Link Omada Controller. "
-        "Provides access to network monitoring, device status, client information, "
-        "WiFi channel analysis, LAN/WLAN configuration, and alerts."
-    ),
-)
-
 _client: OmadaClient | None = None
 
 
@@ -28,6 +20,28 @@ def _get_client() -> OmadaClient:
     if _client is None:
         _client = OmadaClient()
     return _client
+
+
+@asynccontextmanager
+async def _lifespan(server):
+    """Manage OmadaClient lifecycle — clean up on shutdown."""
+    yield
+    global _client
+    if _client is not None:
+        await _client.close()
+        _client = None
+        logger.info("OmadaClient closed.")
+
+
+mcp = FastMCP(
+    "omada",
+    instructions=(
+        "MCP server for TP-Link Omada Controller. "
+        "Provides access to network monitoring, device status, client information, "
+        "WiFi channel analysis, LAN/WLAN configuration, and alerts."
+    ),
+    lifespan=_lifespan,
+)
 
 
 def _fmt_bytes(b: int | float) -> str:
@@ -159,6 +173,24 @@ async def get_alert_count() -> str:
     return f"Active alerts: {data.get('alertNum', 0)}"
 
 
+@mcp.tool()
+async def check_connection() -> str:
+    """Verify that the Omada Controller is reachable and authentication is working."""
+    result = await _get_client().check_connection()
+    if result["connected"]:
+        return (
+            f"Connection: OK\n"
+            f"  Authenticated: yes\n"
+            f"  Controller: {result['controller']}\n"
+            f"  Version: {result['version']}"
+        )
+    return (
+        f"Connection: FAILED\n"
+        f"  Authenticated: {'yes' if result['authenticated'] else 'no'}\n"
+        f"  Error: {result.get('error', 'unknown')}"
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  DEVICE TOOLS
 # ═══════════════════════════════════════════════════════════════════
@@ -167,8 +199,7 @@ async def get_alert_count() -> str:
 @mcp.tool()
 async def get_devices() -> str:
     """List all network devices (gateways, switches, APs) with status, CPU/mem, firmware, and client count."""
-    data = await _get_client().get_devices()
-    devices = data.get("data", []) if isinstance(data, dict) else data
+    devices = await _get_client().get_devices()
     if not devices:
         return "No devices found."
 
@@ -189,8 +220,7 @@ async def get_devices() -> str:
 @mcp.tool()
 async def get_device_detail(name_or_mac: str) -> str:
     """Get detailed info for a single device by name or MAC address."""
-    data = await _get_client().get_devices()
-    devices = data.get("data", []) if isinstance(data, dict) else data
+    devices = await _get_client().get_devices()
     search = name_or_mac.lower()
 
     for d in devices:
@@ -223,14 +253,12 @@ async def get_device_detail(name_or_mac: str) -> str:
 @mcp.tool()
 async def get_active_clients() -> str:
     """List all currently connected clients with IP, MAC, SSID, signal, traffic, and VLAN."""
-    data = await _get_client().get_active_clients()
-    clients = data.get("data", [])
-    total = data.get("totalRows", len(clients))
+    clients = await _get_client().get_active_clients()
 
     if not clients:
         return "No active clients."
 
-    lines = [f"Active Clients ({total}):"]
+    lines = [f"Active Clients ({len(clients)}):"]
     for c in clients:
         name = c.get("name") or c.get("hostName") or c.get("mac", "?")
         conn = "wireless" if c.get("wireless") else "wired"
@@ -255,14 +283,12 @@ async def get_active_clients() -> str:
 @mcp.tool()
 async def get_known_clients() -> str:
     """List all historically known clients (active and inactive) with MAC, last seen, and traffic totals."""
-    data = await _get_client().get_known_clients()
-    clients = data.get("data", [])
-    total = data.get("totalRows", len(clients))
+    clients = await _get_client().get_known_clients()
 
     if not clients:
         return "No known clients."
 
-    lines = [f"Known Clients ({total}):"]
+    lines = [f"Known Clients ({len(clients)}):"]
     for c in clients:
         name = c.get("name") or c.get("mac", "?")
         conn = "wireless" if c.get("wireless") else "wired"
@@ -313,8 +339,17 @@ async def get_ssids() -> str:
     for wlan in wlans:
         lines.append(f"\n  WLAN Group: {wlan.get('wlanName', '?')}")
         for ssid in wlan.get("ssidList", []):
+            security = ssid.get("security", "?")
+            band = ssid.get("band", "")
+            band_str = f"  Band: {band}" if band else ""
+            rate_limit_down = ssid.get("rateLimitDownload", 0)
+            rate_limit_up = ssid.get("rateLimitUpload", 0)
+            rate_str = ""
+            if rate_limit_down or rate_limit_up:
+                rate_str = f"  Rate: {_fmt_bytes(rate_limit_down)}/s down, {_fmt_bytes(rate_limit_up)}/s up"
             lines.append(
                 f"    {ssid.get('ssidName', '?')}  VLAN: {ssid.get('vlanId', '?')}"
+                f"  Security: {security}{band_str}{rate_str}"
             )
 
     return "\n".join(lines)
@@ -323,8 +358,7 @@ async def get_ssids() -> str:
 @mcp.tool()
 async def get_lan_networks() -> str:
     """List LAN network profiles with VLAN, gateway/subnet, DHCP settings, and domain."""
-    data = await _get_client().get_lan_networks()
-    networks = data.get("data", [])
+    networks = await _get_client().get_lan_networks()
     if not networks:
         return "No LAN networks found."
 
@@ -354,14 +388,12 @@ async def get_lan_networks() -> str:
 @mcp.tool()
 async def get_alerts(resolved: bool = False) -> str:
     """Get site alerts. Set resolved=true to include resolved alerts."""
-    data = await _get_client().get_alerts(resolved=resolved)
-    alerts = data.get("data", [])
-    total = data.get("totalRows", len(alerts))
+    alerts = await _get_client().get_alerts(resolved=resolved)
 
     if not alerts:
         return f"No {'resolved ' if resolved else 'active '}alerts."
 
-    lines = [f"Alerts ({total}):"]
+    lines = [f"Alerts ({len(alerts)}):"]
     for a in alerts:
         lines.append(
             f"  [{a.get('level', '?').upper()}] {a.get('msg', a.get('message', '?'))}\n"
