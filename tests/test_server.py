@@ -1,9 +1,16 @@
 """Tests for server-side formatting functions and tools."""
 
+import base64
+
 import pytest
 from unittest.mock import AsyncMock, patch
 
-from omada_mcp.server import _fmt_bytes, get_device_detail, check_connection
+from starlette.testclient import TestClient
+from starlette.applications import Starlette
+from starlette.responses import PlainTextResponse
+from starlette.routing import Route
+
+from omada_mcp.server import _fmt_bytes, get_device_detail, check_connection, BasicAuthMiddleware
 
 
 # ── _fmt_bytes ──────────────────────────────────────────────────────
@@ -127,3 +134,51 @@ async def test_check_connection_tool_failed():
 
     assert "Connection: FAILED" in result
     assert "Connection refused" in result
+
+
+# ── BasicAuthMiddleware ────────────────────────────────────────────
+
+
+def _make_auth_app(username: str = "admin", password: str = "secret") -> Starlette:
+    """Build a tiny Starlette app wrapped with BasicAuthMiddleware."""
+
+    async def _ok(request):
+        return PlainTextResponse("OK")
+
+    app = Starlette(routes=[Route("/", _ok)])
+    app.add_middleware(BasicAuthMiddleware, username=username, password=password)
+    return app
+
+
+def _basic_header(user: str, password: str) -> str:
+    token = base64.b64encode(f"{user}:{password}".encode()).decode()
+    return f"Basic {token}"
+
+
+class TestBasicAuthMiddleware:
+    def test_no_auth_returns_401(self):
+        client = TestClient(_make_auth_app())
+        resp = client.get("/")
+        assert resp.status_code == 401
+        assert resp.headers["www-authenticate"] == 'Basic realm="omada-mcp"'
+
+    def test_wrong_credentials_returns_401(self):
+        client = TestClient(_make_auth_app())
+        resp = client.get("/", headers={"Authorization": _basic_header("wrong", "creds")})
+        assert resp.status_code == 401
+        assert resp.headers["www-authenticate"] == 'Basic realm="omada-mcp"'
+
+    def test_valid_credentials_pass_through(self):
+        client = TestClient(_make_auth_app())
+        resp = client.get("/", headers={"Authorization": _basic_header("admin", "secret")})
+        assert resp.status_code == 200
+        assert resp.text == "OK"
+
+    def test_missing_env_vars_raises_system_exit(self):
+        """main() should raise SystemExit when credentials are missing in HTTP mode."""
+        env = {"MCP_TRANSPORT": "streamable-http"}
+        with patch.dict("os.environ", env, clear=False), \
+             patch.dict("os.environ", {"MCP_USERNAME": "", "MCP_PASSWORD": ""}):
+            from omada_mcp.server import main
+            with pytest.raises(SystemExit, match="MCP_USERNAME and MCP_PASSWORD"):
+                main()

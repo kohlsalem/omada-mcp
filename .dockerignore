@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.git/
+.gitignore
+dist/
+*.egg-info/
+tests/
+docs/
+tasks/
+project/
+.clinerules*
+.claude/
+.mcp.json
+.playwright-mcp/

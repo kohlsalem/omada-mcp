@@ -20,9 +20,11 @@ OMADA_PASSWORD=changeme
 OMADA_SKIP_TLS_VERIFY=true
 ```
 
-## Claude Code Registration
+## Deployment
 
-Add to `~/.claude/settings.json`:
+### Local (stdio — default)
+
+Register with Claude Code in `~/.claude/settings.json`:
 
 ```json
 {
@@ -33,6 +35,27 @@ Add to `~/.claude/settings.json`:
   }
 }
 ```
+
+### Docker (HTTP with Basic Auth)
+
+```bash
+cp .env.example .env
+# Edit .env — set OMADA_* and MCP_USERNAME/MCP_PASSWORD
+
+docker compose up -d
+```
+
+The server starts on port 8000 with Basic Auth. Connect any MCP client using the streamable-http transport at `http://<host>:8000/mcp/`.
+
+Environment variables for HTTP mode:
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `MCP_TRANSPORT` | no | `stdio` | `stdio` or `streamable-http` |
+| `MCP_HOST` | no | `0.0.0.0` | Bind address |
+| `MCP_PORT` | no | `8000` | Listen port |
+| `MCP_USERNAME` | yes (HTTP) | — | Basic Auth username |
+| `MCP_PASSWORD` | yes (HTTP) | — | Basic Auth password |
 
 ## Available Tools
 
@@ -56,8 +79,8 @@ Add to `~/.claude/settings.json`:
 ## Testing
 
 ```bash
-# Unit tests
-pytest tests/test_client_auth.py -v
+# Unit tests (all)
+pytest tests/ -v --ignore=tests/test_live.py
 
 # Live integration tests (requires .env)
 pytest tests/test_live.py -v -s

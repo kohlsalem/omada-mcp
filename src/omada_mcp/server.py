@@ -1,16 +1,64 @@
 """Omada MCP Server — tools for monitoring and managing an Omada Controller."""
 
+import base64
 import logging
+import os
+import secrets
 import sys
 from contextlib import asynccontextmanager
 
+import uvicorn
 from mcp.server.fastmcp import FastMCP
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response
 
 from omada_mcp.client import OmadaClient
 
 # Logging to stderr only (stdout is JSON-RPC)
 logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("omada-mcp")
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  BASIC AUTH MIDDLEWARE (HTTP mode only)
+# ═══════════════════════════════════════════════════════════════════
+
+
+class BasicAuthMiddleware(BaseHTTPMiddleware):
+    """Starlette middleware enforcing HTTP Basic Authentication."""
+
+    def __init__(self, app, username: str, password: str):
+        super().__init__(app)
+        self._username = username
+        self._password = password
+
+    async def dispatch(self, request: Request, call_next):
+        auth_header = request.headers.get("authorization", "")
+        if not auth_header.startswith("Basic "):
+            return self._unauthorized()
+
+        try:
+            decoded = base64.b64decode(auth_header[6:]).decode("utf-8")
+            user, password = decoded.split(":", 1)
+        except Exception:
+            return self._unauthorized()
+
+        if not (
+            secrets.compare_digest(user, self._username)
+            and secrets.compare_digest(password, self._password)
+        ):
+            return self._unauthorized()
+
+        return await call_next(request)
+
+    @staticmethod
+    def _unauthorized() -> Response:
+        return Response(
+            "Unauthorized",
+            status_code=401,
+            headers={"WWW-Authenticate": 'Basic realm="omada-mcp"'},
+        )
 
 _client: OmadaClient | None = None
 
@@ -409,7 +457,30 @@ async def get_alerts(resolved: bool = False) -> str:
 
 
 def main():
-    mcp.run(transport="stdio")
+    transport = os.environ.get("MCP_TRANSPORT", "stdio").strip().lower()
+
+    if transport == "stdio":
+        mcp.run(transport="stdio")
+    elif transport == "streamable-http":
+        username = os.environ.get("MCP_USERNAME", "")
+        password = os.environ.get("MCP_PASSWORD", "")
+        if not username or not password:
+            raise SystemExit(
+                "MCP_USERNAME and MCP_PASSWORD must be set for HTTP transport."
+            )
+
+        host = os.environ.get("MCP_HOST", "0.0.0.0")
+        port = int(os.environ.get("MCP_PORT", "8000"))
+
+        app = mcp.streamable_http_app()
+        app.add_middleware(BasicAuthMiddleware, username=username, password=password)
+
+        logger.info("Starting HTTP server on %s:%d", host, port)
+        uvicorn.run(app, host=host, port=port)
+    else:
+        raise SystemExit(
+            f"Unknown MCP_TRANSPORT={transport!r}. Use 'stdio' or 'streamable-http'."
+        )
 
 
 if __name__ == "__main__":

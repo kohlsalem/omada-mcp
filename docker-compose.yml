@@ -1,0 +1,22 @@
+services:
+  omada-mcp:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # Transport (default: streamable-http in Docker)
+      MCP_TRANSPORT: streamable-http
+      MCP_HOST: "0.0.0.0"
+      MCP_PORT: "8000"
+
+      # Auth (required for HTTP mode)
+      MCP_USERNAME: ${MCP_USERNAME:?Set MCP_USERNAME}
+      MCP_PASSWORD: ${MCP_PASSWORD:?Set MCP_PASSWORD}
+
+      # Omada Controller
+      OMADA_URL: ${OMADA_URL:?Set OMADA_URL}
+      OMADA_USERNAME: ${OMADA_USERNAME:?Set OMADA_USERNAME}
+      OMADA_PASSWORD: ${OMADA_PASSWORD:?Set OMADA_PASSWORD}
+      # OMADA_SITE: ${OMADA_SITE:-}
+      # OMADA_SKIP_TLS_VERIFY: ${OMADA_SKIP_TLS_VERIFY:-false}
+    restart: unless-stopped
