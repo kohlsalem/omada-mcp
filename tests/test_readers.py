@@ -302,3 +302,83 @@ async def test_acl_resources_select_standard_type_and_keep_custom_separate(clien
     for resource, typ in [("gateway_acls", 0), ("switch_acls", 1), ("ap_acls", 2)]:
         assert (await client.get_site_resource(resource))[0]["type"] == typ
     assert await client.get_site_resource("gateway_custom_acls") == []
+
+
+@pytest.mark.asyncio
+async def test_events_bounded_pages_filters_and_stable_window(client):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if request.url.path.endswith("notification"):
+            return respond({"eventNotifications": [{"key": "TEST", "level": "Warning"}]})
+        assert request.url.params["currentPageSize"] == "2"
+        return respond({"totalRows": 6, "data": [
+            {"key": "OTHER", "module": "Device", "device": {"name": "AP"}},
+            {"key": "TEST", "module": "Device", "device": {"name": "AP"}},
+        ]})
+
+    client._http = httpx.AsyncClient(base_url=client.base_url, transport=httpx.MockTransport(handler))
+    result = await client.get_events(start_ms=1000, end_ms=2000, limit=2,
+                                     event_key="TEST", severity="warning", device="ap")
+    assert len(result["data"]) == 1
+    assert result["next_page"] == 2
+    assert result["totalRows"] == 6
+    assert result["range"] == {"start_ms": 1000, "end_ms": 2000}
+    result = await client.get_events(start_ms=1000, end_ms=2000, limit=2, event_key="MISSING")
+    assert result["data"] == [] and result["has_more"] is True
+    with pytest.raises(ValueError, match="limit"):
+        await client.get_events(limit=10000)
+
+
+@pytest.mark.asyncio
+async def test_events_default_one_day_and_clip_oversized_row(client):
+    def handler(request):
+        assert int(request.url.params["filters.timeEnd"]) - int(request.url.params["filters.timeStart"]) == 86400000
+        assert request.url.params["currentPageSize"] == "50"
+        return respond({"totalRows": 1, "data": [{"key": "TEST", "content": "x" * 1000000}]})
+
+    client._http = httpx.AsyncClient(base_url=client.base_url, transport=httpx.MockTransport(handler))
+    result = await client.get_events()
+    assert result["data"][0]["truncated_fields"] is True
+    assert len(result["data"][0]["content"]) == 512
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("query", [" Synology ", "nas-host", "10.10.0.10", "synol"])
+async def test_client_alias_hostname_ip_and_unique_partial(client, query):
+    row = {"mac": "AA-BB-CC-DD-EE-FF", "name": "Synology", "hostname": "nas-host", "ip": "10.10.0.10"}
+
+    def handler(request):
+        if request.url.path.endswith(("/clients", "insight/clients")):
+            return respond({"data": [row], "totalRows": 1})
+        return respond(row)
+
+    client._http = httpx.AsyncClient(base_url=client.base_url, transport=httpx.MockTransport(handler))
+    assert (await client.get_client_detail(query))["name"] == "Synology"
+
+
+@pytest.mark.asyncio
+async def test_acl_resolves_negation_groups_and_reports_missing_counters(client):
+    def handler(request):
+        path = request.url.path
+        if path.endswith("firewall/acls"):
+            assert request.url.params["type"] == "0"
+            return respond({"data": [{"policy": 0, "sourceType": 1, "sourceIds": ["ip1"],
+                                      "destinationType": 11, "destinationIds": ["net1"], "syslog": True}],
+                            "totalRows": 1, "supportHitCount": False})
+        if path.endswith("groups/0"):
+            return respond({"data": [{"groupId": "ip1", "name": "PC", "ipList": [{"ip": "10.0.0.1"}]}]})
+        if path.endswith("lan/networks"):
+            return respond({"data": [{"id": "net1", "name": "IoT", "vlan": 20}], "totalRows": 1})
+        if path.endswith("setting/ssids"):
+            return respond({"ssids": []})
+        return respond({"data": [], "totalRows": 0})
+
+    client._http = httpx.AsyncClient(base_url=client.base_url, transport=httpx.MockTransport(handler))
+    rule = (await client.get_acl_rules())["data"][0]
+    assert rule["sourceResolved"]["objects"][0]["value"]["name"] == "PC"
+    assert rule["destinationResolved"]["negated"] is True
+    assert rule["destinationResolved"]["objects"][0]["value"]["vlan"] == 20
+    assert rule["syslogStatus"]["configured"] is True
+    assert rule["hitCounterStatus"] == {"supported": False, "value": None, "available": False}

@@ -10,7 +10,7 @@ import pytest_asyncio
 from pathlib import Path
 from dotenv import load_dotenv
 
-from omada_mcp.client import OmadaClient, SITE_RESOURCES
+from omada_mcp.client import OmadaClient, SITE_RESOURCES, OPENAPI_RESOURCES, CONTROLLER_RESOURCES, OmadaApiError
 
 # Load .env from project root
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
@@ -104,7 +104,12 @@ class TestLiveController:
 
     @pytest.mark.parametrize("resource", SITE_RESOURCES)
     async def test_read_resources(self, client, resource):
-        result = await client.get_site_resource(resource)
+        try:
+            result = await client.get_site_resource(resource)
+        except OmadaApiError as exc:
+            if resource == "device_account" and exc.error_code == -1007:
+                pytest.skip("Viewer is explicitly denied device-account settings")
+            raise
         assert isinstance(result, (dict, list))
 
     async def test_detailed_readers(self, client):
@@ -120,7 +125,7 @@ class TestLiveController:
             detail = await client.get_client_detail(clients[0]["mac"], site)
             assert detail["mac"] == clients[0]["mac"]
         assert "topologyArray" in await client.get_topology(site)
-        assert isinstance(await client.get_events(site), list)
+        assert isinstance((await client.get_events(site))["data"], list)
 
     async def test_usage_and_reports(self, client):
         usage = await client.get_application_usage()
@@ -159,3 +164,39 @@ class TestLiveController:
                 result = await client.get_vpn_detail(item["id"], group=group)
                 assert result["configuration"]["id"] == item["id"]
                 assert result["configuration"]["vpnType"] == item["vpnType"]
+
+    @pytest.mark.parametrize("resource", [*OPENAPI_RESOURCES, "vpn_users"])
+    async def test_new_openapi_resources(self, client, resource):
+        assert isinstance(await client.get_site_resource(resource), (dict, list))
+
+    @pytest.mark.parametrize("resource", CONTROLLER_RESOURCES)
+    async def test_controller_resources(self, client, resource):
+        try:
+            assert isinstance(await client.get_controller_resource(resource), (dict, list))
+        except OmadaApiError as exc:
+            if resource == "auto_backup" and exc.error_code == -1007:
+                pytest.skip("Viewer is explicitly denied auto-backup settings")
+            raise
+
+    async def test_bounded_events_acl_resolution_and_masked_ssid(self, client):
+        import json
+        from omada_mcp.output import prepare_output
+
+        result = await client.get_events(limit=10)
+        assert len(result["data"]) <= 10
+        assert result["range"]["end_ms"] - result["range"]["start_ms"] == 86400000
+        assert len(json.dumps(prepare_output(result))) < 150000
+        for kind, typ in [("gateway", 0), ("switch", 1), ("ap", 2)]:
+            acl = await client.get_acl_rules(kind)
+            assert all(row["type"] == typ for row in acl["data"])
+            assert all("sourceResolved" in row for row in acl["data"])
+        ssids = await client.get_site_resource("ssid_details")
+        if ssids:
+            detail = await client.get_ssid_detail(ssids[0]["id"])
+            masked = prepare_output(detail)
+            if detail.get("pskSetting", {}).get("securityKey"):
+                assert masked["pskSetting"]["securityKey"] == "[REDACTED]"
+        for device in await client.get_devices():
+            if device["type"] == "ap":
+                assert isinstance(await client.get_rf_scan(device["mac"]), (dict, list))
+                break

@@ -43,6 +43,47 @@ SITE_RESOURCES = {
     "wlans": ("setting/wlans", False),
     "ssids": ("setting/ssids", False),
     "lan_networks": ("setting/lan/networks", True),
+    "ip_groups": ("setting/profiles/groups/0", False),
+    "ip_port_groups": ("setting/profiles/groups/1", False),
+    "mac_groups": ("setting/profiles/groups/2", False),
+    "time_profiles": ("setting/profiles/timeranges", False),
+    "wireless_features": ("setting/wireless/feature", False),
+    "site_settings": ("setting", False),
+    "device_account": ("setting/device_account", False),
+    "attack_defense": ("setting/firewall/attackdefense", False),
+    "mac_filter_settings": ("setting/firewall/macfilter", False),
+    "mac_filters": ("setting/firewall/macfilters", True),
+    "ips_settings": ("setting/ips", False),
+    "upnp": ("setting/upnp", False),
+    "mdns": ("setting/service/mdns", True),
+    "bonjour_profiles": ("setting/profiles/mdns", False),
+    "ddns": ("setting/service/ddns", True),
+    "reboot_schedules": ("setting/service/rebootSchedules", True),
+    "poe_schedules": ("setting/port-schedules", False),
+    "upgrade_schedules": ("setting/service/upgrade-schedules", True),
+    "one_to_one_nat": ("setting/transmission/otonats", True),
+    "disable_nat": ("setting/wired-networks/disable-nats", True),
+    "ip_mac_binding_settings": ("setting/firewall/imb", False),
+    "ip_mac_bindings": ("setting/firewall/imbs", True),
+    "url_filters": ("setting/firewall/urlfilterings", True),
+    "ap_url_filters": ("setting/firewall/urlfilterings", True),
+    "rogue_aps": ("insight/rogueaps", True),
+    "mac_auth": ("setting/macAuth", False),
+    "nat_alg": ("setting/transmission/alg", False),
+}
+
+CONTROLLER_RESOURCES = {
+    "settings": ("controller/setting", False),
+    "general_ntp": ("controller/settings/general", False),
+    "cloud_access": ("cloud/status", False),
+    "users": ("account/users", True),
+    "roles": ("roles", False),
+    "current_user_mfa": ("current/user-detail", False),
+    "auto_backup": ("autoBackup/autoBackupTask", False),
+}
+OPENAPI_RESOURCES = {
+    "rrm": "rrm/config", "remote_logging": "remote-logging",
+    "lan_multicast": "lan-multicasts", "ssid_details": "wireless-network/ssid-operation",
 }
 
 REPORT_CARDS = (
@@ -374,18 +415,207 @@ class OmadaClient:
     async def get_events(
         self, site: str | None = None,
         start_ms: int | None = None, end_ms: int | None = None,
-    ) -> list[dict[str, Any]]:
+        *, page: int = 1, limit: int = 50, event_key: str | None = None,
+        severity: str | None = None, device: str | None = None,
+    ) -> dict:
+        if page < 1 or not 1 <= limit <= 100:
+            raise ValueError("page must be >= 1 and limit between 1 and 100")
+        end_ms = int(time.time() * 1000) if end_ms is None else end_ms
+        start_ms = max(0, end_ms - 86400000) if start_ms is None else start_ms
+        params = {**self._time_filters(start_ms, end_ms),
+                  "currentPage": page, "currentPageSize": limit, "sorts.time": "desc"}
+        result = await self._read_site("logs/events", site, params=params)
+        definitions = {}
+        if severity:
+            notifications = await self._read_site("logs/notification", site)
+            for entries in notifications.values():
+                if isinstance(entries, list):
+                    definitions.update({e["key"]: e.get("level") for e in entries
+                                        if isinstance(e, dict) and "key" in e})
+        entries = []
+        for item in result.get("data", [])[:limit]:
+            level = item.get("level") or definitions.get(item.get("key"))
+            if event_key and str(item.get("key", "")).casefold() != event_key.casefold():
+                continue
+            if severity and str(level).casefold() != severity.casefold():
+                continue
+            dev = item.get("device") or {}
+            if device and not self._identity_matches(dev, device):
+                continue
+            entry = dict(item)
+            if level:
+                entry["severity"] = level
+            # Keep each row bounded, including nested serialized payloads. Normal
+            # events preserve their fields; oversized rows are explicitly marked.
+            if len(json.dumps(entry, ensure_ascii=False).encode()) > 2048:
+                entry = {k: entry[k] for k in ("id", "key", "module", "time", "level", "severity") if k in entry}
+                entry["content"] = str(item.get("content", ""))[:512]
+                entry["truncated_fields"] = True
+            entries.append(entry)
+        total = result.get("totalRows", 0)
+        more = page * limit < total
+        return {"data": entries, "page": page, "limit": limit, "totalRows": total,
+                "next_page": page + 1 if more else None, "has_more": more,
+                "range": {"start_ms": start_ms, "end_ms": end_ms},
+                "filter_scope": "event_key/severity/device applied locally to this API page",
+                "scanned": len(result.get("data", [])),
+                "filters": {"event_key": event_key, "severity": severity, "device": device}}
+
+    async def get_controller_resource(self, resource: str) -> Any:
+        if resource not in CONTROLLER_RESOURCES:
+            raise ValueError(f"Unknown controller resource. Choose from: {', '.join(CONTROLLER_RESOURCES)}")
+        endpoint, paginated = CONTROLLER_RESOURCES[resource]
+        path = lambda: self._controller_path(endpoint)
+        if paginated:
+            return await self._get_all_pages(path)
+        return await self._get(path)
+
+    async def get_ssid_detail(self, name_or_id: str, site: str | None = None) -> dict:
+        table = await self.get_site_resource("ssid_details", site)
+        matches = [row for row in table if row.get("id") == name_or_id
+                   or str(row.get("idInt", "")) == name_or_id
+                   or str(row.get("name", "")).casefold() == name_or_id.casefold()]
+        if len(matches) != 1:
+            raise ValueError(f"SSID {name_or_id!r}: {len(matches)} matches; select an ID from ssid_details")
+        return await self._read_openapi_site(
+            f"wireless-network/ssids/{quote(matches[0]['id'], safe='')}", site,
+        )
+
+    async def get_rf_scan(self, name_or_mac: str, site: str | None = None) -> Any:
+        device = await self._find_device(name_or_mac, site)
+        if device.get("type") != "ap":
+            raise ValueError("RF scan results are available only for APs")
         return await self._read_site(
-            "logs/events", site, params=self._time_filters(start_ms, end_ms), paginated=True,
+            f"{self._device_endpoint(device)}/tools/rfScan", site,
         )
 
     async def get_site_resource(self, resource: str, site: str | None = None) -> Any:
+        if resource in OPENAPI_RESOURCES:
+            endpoint = OPENAPI_RESOURCES[resource]
+            if resource not in ("ssid_details", "lan_multicast"):
+                return await self._read_openapi_site(endpoint, site)
+            items = []
+            page = 1
+            while True:
+                result = await self._read_openapi_site(endpoint, site, {"page": page, "pageSize": 100})
+                rows = result.get("data", [])
+                items.extend(rows)
+                if not rows or len(items) >= result.get("totalRows", 0):
+                    return items
+                page += 1
+        if resource == "vpn_users":
+            site_id = await self._resolve_site(site)
+            items = []
+            page = 1
+            while True:
+                result = await self._get(
+                    lambda: f"/openapi/v2/{self._omadac_id}/sites/{quote(site_id, safe='')}/vpn/users",
+                    params={"page": page, "pageSize": 100},
+                )
+                items.extend(result.get("data", []))
+                if not result.get("data") or len(items) >= result.get("totalRows", 0):
+                    return items
+                page += 1
         if resource not in SITE_RESOURCES:
             raise ValueError(f"Unknown resource {resource!r}. Choose from: {', '.join(SITE_RESOURCES)}")
         endpoint, paginated = SITE_RESOURCES[resource]
         acl_types = {"gateway_acls": 0, "switch_acls": 1, "ap_acls": 2}
         params = {"type": acl_types[resource]} if resource in acl_types else None
+        if resource in ("url_filters", "ap_url_filters"):
+            params = {"type": "gateway" if resource == "url_filters" else "ap"}
         return await self._read_site(endpoint, site, params=params, paginated=paginated)
+
+    async def get_acl_rules(self, kind: str = "gateway", site: str | None = None) -> dict:
+        if kind not in ("gateway", "switch", "ap"):
+            raise ValueError("kind must be gateway, switch or ap")
+        typ = {"gateway": 0, "switch": 1, "ap": 2}[kind]
+        # Preserve feature flags (e.g. unsupported counters) as well as all rules.
+        first = await self._read_site("setting/firewall/acls", site,
+                                      params={"type": typ, "currentPage": 1, "currentPageSize": 100})
+        rules = list(first.get("data", []))
+        page = 2
+        while rules and len(rules) < first.get("totalRows", 0):
+            result = await self._read_site("setting/firewall/acls", site,
+                                           params={"type": typ, "currentPage": page, "currentPageSize": 100})
+            rows = result.get("data", [])
+            if not rows:
+                break
+            rules.extend(rows)
+            page += 1
+        errors = {}
+        async def optional(resource):
+            try:
+                return await self.get_site_resource(resource, site)
+            except (OmadaApiError, httpx.HTTPStatusError) as exc:
+                errors[resource] = str(exc)
+                return []
+
+        def rows(data):
+            return data.get("data", []) if isinstance(data, dict) else data
+
+        indexes = {}
+        resources = {0: "lan_networks", 1: "ip_groups", 2: "ip_port_groups", 3: "mac_groups"}
+        for code, resource in resources.items():
+            indexes[code] = {x.get("id", x.get("groupId")): x for x in rows(await optional(resource))}
+        ssids = await self.get_ssids(site)
+        indexes[4] = {s["ssidId"]: {**s, "wlanName": w.get("wlanName")}
+                      for w in ssids.get("ssids", []) for s in w.get("ssidList", [])}
+        profiles = {x["id"]: x for x in rows(await optional("time_profiles"))}
+        devices = await self.get_devices(site) if kind == "switch" else []
+        device_index = {d.get("mac"): d for d in devices}
+        switch_ports = {}
+        if kind == "switch":
+            for dev in devices:
+                if dev.get("type") == "switch":
+                    try:
+                        switch_ports[dev["mac"]] = await self.get_device_ports(dev["mac"], site)
+                    except (OmadaApiError, httpx.HTTPStatusError) as exc:
+                        errors[f"ports:{dev['mac']}"] = str(exc)
+        type_names = {0: "network", 1: "ip_group", 2: "ip_port_group", 3: "mac_group",
+                      4: "ssid", 5: "gateway_management", 6: "ipv6_group", 7: "ipv6_port_group",
+                      8: "country", 9: "country_group", 10: "domain_port_group",
+                      11: "not_network", 12: "not_ip_group", 13: "not_ip_port_group",
+                      14: "not_ipv6_group", 15: "not_ipv6_port_group", 24: "domain_group"}
+        for rule in rules:
+            rule["policyText"] = {0: "deny", 1: "permit"}.get(rule.get("policy"), "unknown")
+            for side in ("source", "destination"):
+                code = rule.get(f"{side}Type")
+                base = {11: 0, 12: 1, 13: 2, 14: 6, 15: 7}.get(code, code)
+                refs = rule.get(f"{side}Ids", [])
+                rule[f"{side}Resolved"] = {
+                    "type": type_names.get(code, "unknown"), "negated": code in (11, 12, 13, 14, 15),
+                    "objects": [{"id": ref, "resolved": ref in indexes.get(base, {}),
+                                 "value": indexes.get(base, {}).get(ref)} for ref in refs],
+                }
+            rule["timeProfileResolved"] = profiles.get(rule.get("timeRangeId"))
+            rule["syslogStatus"] = {"configured": rule.get("syslog"), "available": "syslog" in rule}
+            rule["hitCounterStatus"] = {
+                "supported": first.get("supportHitCount"),
+                "value": rule.get("hitCounts", rule.get("hitCount")),
+                "available": "hitCounts" in rule or "hitCount" in rule,
+            }
+            if kind == "switch":
+                bound = rule.get("customAclDevices", [])
+                rule["bindingResolved"] = {
+                    "bindingType": rule.get("bindingType"),
+                    "bindingTypeText": {0: "all_ports", 1: "custom_ports", 2: "all_switches", 3: "custom_switches"}.get(rule.get("bindingType"), "unknown"),
+                    "devices": [{"raw": d, "device": device_index.get(d) if isinstance(d, str) else None}
+                                for d in bound],
+                    "ports": rule.get("customAclPorts", []),
+                    "network": indexes[0].get(rule.get("networkId")),
+                    "inventoryPorts": [{"switchMac": mac, "switchName": device_index.get(mac, {}).get("name"),
+                                        "ports": [{"port": p.get("port"), "name": p.get("name"), "id": p.get("id")}
+                                                  for p in ports]}
+                                       for mac, ports in switch_ports.items()
+                                       if rule.get("bindingType") in (0, 2)
+                                       or mac in bound
+                                       or any(isinstance(p, dict) and p.get("mac") == mac for p in rule.get("customAclPorts", []))],
+                    "note": "inventoryPorts lists candidate inventory ports, not runtime enforcement; custom selections remain in ports. VLAN-based bindings also require the selected network.",
+                }
+        return {"kind": kind, "data": rules,
+                "capabilities": {k: v for k, v in first.items() if k != "data"},
+                "resolution_errors": errors,
+                "note": "Configured rules are not proof of enforcement. Missing hit counters are unavailable, not zero."}
 
     async def get_topology(self, site: str | None = None) -> dict:
         return await self._read_site("topology-v2", site)
@@ -629,7 +859,7 @@ class OmadaClient:
             return value.casefold().replace(":", "").replace("-", "").replace(".", "")
         return any(
             str(item.get(key, "")).casefold() == query.casefold()
-            for key in ("name", "hostName", "ip")
+            for key in ("name", "hostName", "hostname", "host_name", "systemName", "ip", "ipAddress")
         ) or (bool(item.get("mac")) and normalize(item["mac"]) == normalize(query))
 
     async def _find_device(self, name_or_mac: str, site: str | None = None) -> dict:
@@ -654,11 +884,27 @@ class OmadaClient:
         return await self._read_site(f"{self._device_endpoint(device)}/ports", site)
 
     async def get_client_detail(self, name_or_mac_or_ip: str, site: str | None = None) -> dict:
-        matches = [c for c in await self.get_active_clients(site)
-                   if self._identity_matches(c, name_or_mac_or_ip)]
+        query = name_or_mac_or_ip.strip()
+        if not query:
+            raise ValueError("Client lookup requires a nonempty name, hostname, MAC or IP")
+        active = await self.get_active_clients(site)
+        candidates = active
+        matches = [c for c in candidates if self._identity_matches(c, query)]
         if not matches:
-            matches = [c for c in await self.get_known_clients(site)
-                       if self._identity_matches(c, name_or_mac_or_ip)]
+            known = await self.get_known_clients(site)
+            # Prefer the active record's fields for duplicate MACs.
+            merged = {c["mac"]: c for c in known if c.get("mac")}
+            for record in active:
+                if record.get("mac"):
+                    merged[record["mac"]] = {**merged.get(record["mac"], {}),
+                                             **{k: v for k, v in record.items() if v not in (None, "")}}
+            candidates = list(merged.values())
+            matches = [c for c in candidates if self._identity_matches(c, query)]
+        if not matches:
+            matches = [c for c in candidates if any(
+                query.casefold() in str(c.get(k, "")).casefold()
+                for k in ("name", "hostName", "hostname", "host_name", "systemName")
+            )]
         if len(matches) != 1:
             raise ValueError(f"Client {name_or_mac_or_ip!r}: {len(matches)} matches. Select a MAC from the client lists.")
         mac = quote(matches[0]["mac"], safe="")

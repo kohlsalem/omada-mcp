@@ -14,7 +14,8 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
-from omada_mcp.client import OmadaClient, SITE_RESOURCES, REPORT_CARDS
+from omada_mcp.client import OmadaClient, SITE_RESOURCES, REPORT_CARDS, OPENAPI_RESOURCES, CONTROLLER_RESOURCES
+from omada_mcp.output import prepare_output
 
 # Logging to stderr only (stdout is JSON-RPC)
 logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(levelname)s %(name)s: %(message)s")
@@ -269,9 +270,13 @@ async def get_devices(site: str | None = None) -> str:
 
 
 @mcp.tool()
-async def get_device_detail(name_or_mac: str, site: str | None = None) -> str:
-    """Read full device configuration/status: AP radios/uplink, switch STP/PoE, or gateway ports."""
-    return _json(await _get_client().get_device_detail(name_or_mac, site))
+async def get_device_detail(name_or_mac: str, site: str | None = None, include_secrets: bool = False) -> str:
+    """Read device configuration/status. Secrets masked unless include_secrets=true.
+
+    ssidOverrides are overrides/placeholders, not effective WLAN settings; use
+    get_ssid_detail for configured SSID/VLAN/security values.
+    """
+    return _json(await _get_client().get_device_detail(name_or_mac, site), include_secrets)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -438,19 +443,28 @@ async def get_alerts(
 
 
 # Detailed readers preserve controller fields rather than guessing model-specific schemas.
-def _json(data) -> str:
-    return json.dumps(data, ensure_ascii=False, indent=2)
+def _json(data, include_secrets: bool = False) -> str:
+    return json.dumps(prepare_output(data, include_secrets), ensure_ascii=False, indent=2)
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
 async def list_read_resources() -> str:
     """Discover settings/status sections supported by read_site_resource, with API paths."""
-    return _json({name: {"endpoint": path, "paginated": paginated}
-                  for name, (path, paginated) in SITE_RESOURCES.items()})
+    acl_types = {"gateway_acls": 0, "switch_acls": 1, "ap_acls": 2}
+    resources = {name: {"endpoint": path, "paginated": paginated,
+                         "params": {"type": acl_types[name]} if name in acl_types else {}}
+                  for name, (path, paginated) in SITE_RESOURCES.items()}
+    resources.update({name: {"endpoint": endpoint, "api": "openapi/v1",
+                             "paginated": name in ("ssid_details", "lan_multicast")}
+                      for name, endpoint in OPENAPI_RESOURCES.items()})
+    resources["vpn_users"] = {"endpoint": "vpn/users", "api": "openapi/v2", "paginated": True}
+    for name in ("url_filters", "ap_url_filters"):
+        resources[name]["params"] = {"type": "gateway" if name == "url_filters" else "ap"}
+    return _json(resources)
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
-async def read_site_resource(resource: str, site: str | None = None) -> str:
+async def read_site_resource(resource: str, site: str | None = None, include_secrets: bool = False) -> str:
     """Read full JSON for a settings/status section. Use list_read_resources for names.
 
     Includes wan, gateway_acls, switch_acls, ap_acls, gateway_custom_acls,
@@ -463,8 +477,64 @@ async def read_site_resource(resource: str, site: str | None = None) -> str:
     gateway_acls reads standard rules; gateway_custom_acls is a separate table.
     Check gateway_acl_mode before interpreting an empty table. These are configured
     rules, not proof of enforcement; use device/config-sync status separately.
+    Use list_read_resources for the complete current list (groups, time profiles,
+    WLAN/RRM, security, services, schedules and remote logging included).
+    Secrets are masked unless include_secrets=true. WAN onlineDetection describes
+    configured probes, not measured health; inspect overview WAN status separately.
     """
-    return _json(await _get_client().get_site_resource(resource, site))
+    return _json(await _get_client().get_site_resource(resource, site), include_secrets)
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
+async def list_controller_resources() -> str:
+    """Discover controller settings, NTP, cloud access, users/roles/MFA and auto-backup readers.
+
+    Viewer permissions vary; device_account and auto_backup may be permission-denied.
+    Certificate metadata is in settings.certificate; no private certificate export.
+    """
+    return _json({name: {"endpoint": path, "paginated": pages}
+                  for name, (path, pages) in CONTROLLER_RESOURCES.items()})
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
+async def read_controller_resource(resource: str, include_secrets: bool = False) -> str:
+    """Read an allowlisted controller configuration section. Discover via list_controller_resources.
+
+    Secrets masked by default. include_secrets=true explicitly opts into plaintext
+    values available to the controller account. Permission failures remain errors.
+    """
+    return _json(await _get_client().get_controller_resource(resource), include_secrets)
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
+async def get_ssid_detail(name_or_id: str, site: str | None = None, include_secrets: bool = False) -> str:
+    """Read configured SSID security/PSK mode, PMF, band, isolation/guest, rate limits,
+    MAC filter/auth, schedule, VLAN and multicast fields from the dedicated endpoint.
+    Names must match exactly (case-insensitive); IDs disambiguate duplicate SSIDs.
+    Secrets masked unless include_secrets=true. Unlike AP overrides these are the
+    SSID's configured settings, not proof of every device's effective provisioning.
+    """
+    return _json(await _get_client().get_ssid_detail(name_or_id, site), include_secrets)
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
+async def get_acl_rules(kind: str = "gateway", site: str | None = None) -> str:
+    """Read gateway/switch/ap ACLs with network, IP/IP-port/MAC group, SSID and time-profile resolution.
+
+    Adds source/destination type names and negation (e.g. 11=not_network), syslog
+    configuration and hit-counter availability, preserving raw rule fields. Switch
+    device/port binding selections are included. Unsupported counters are unknown,
+    never zero. Resolution errors are reported separately from empty object lists.
+    """
+    return _json(await _get_client().get_acl_rules(kind, site))
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
+async def get_rf_scan(name_or_mac: str, site: str | None = None) -> str:
+    """Read existing AP RF scan results/status only. Does not trigger a scan or interrupt radios.
+    No completed scan may mean status only. Rogue APs are read via resource rogue_aps.
+    """
+    return _json(await _get_client().get_rf_scan(name_or_mac, site))
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
@@ -493,6 +563,7 @@ async def get_vpn_configs(site: str | None = None, group: str | None = None) -> 
 @mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
 async def get_vpn_detail(
     name_or_id: str, site: str | None = None, group: str | None = None,
+    include_secrets: bool = False,
 ) -> str:
     """Read full VPN configuration by exact name or ID, with case-insensitive name matching.
 
@@ -500,9 +571,9 @@ async def get_vpn_detail(
     controller fields: IPsec/IKE phase-1/phase-2 proposals, remote/local networks,
     peers, authentication/encryption and lifetimes where returned. L2TP encryption
     is separate from standalone IPsec (vpnType=2). Configuration can include secret
-    values returned by the account. This is configuration, not live tunnel status.
+    values only with include_secrets=true (default masked). This is configuration, not live tunnel status.
     """
-    return _json(await _get_client().get_vpn_detail(name_or_id, site, group))
+    return _json(await _get_client().get_vpn_detail(name_or_id, site, group), include_secrets)
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
@@ -513,16 +584,31 @@ async def get_device_ports(name_or_mac: str, site: str | None = None) -> str:
 
 @mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
 async def get_client_detail(name_or_mac_or_ip: str, site: str | None = None) -> str:
-    """Find a client by exact name, MAC or IP; read signal/SNR, AP/switch, rates, VLAN, IP settings and status."""
+    """Find a client by name, hostname, MAC or IP (trimmed/case-insensitive).
+    Exact matches preferred; unique partial names accepted. Ambiguous results require
+    a MAC. Returns signal/SNR, AP/switch, rates, VLAN, IP settings and status.
+    """
     return _json(await _get_client().get_client_detail(name_or_mac_or_ip, site))
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
 async def get_events(
     site: str | None = None, start_ms: int | None = None, end_ms: int | None = None,
+    page: int = 1, limit: int = 50, event_key: str | None = None,
+    severity: str | None = None, device: str | None = None,
 ) -> str:
-    """Read all site event-log pages as JSON. Unix millisecond range defaults to last 30 days."""
-    return _json(await _get_client().get_events(site, start_ms, end_ms))
+    """Read ONE bounded event page (default 50, max 100) from the last 24h.
+
+    Follow next_page with the SAME returned range/limit/filters, including when a
+    filtered page is empty. event_key/severity/device filter the fetched page locally
+    (not all historical pages); totalRows is before those filters. Device accepts
+    name or MAC. Severity is resolved from notification definitions when absent.
+    Long text fields are clipped; truncated_fields marks those fields.
+    """
+    return _json(await _get_client().get_events(
+        site, start_ms, end_ms, page=page, limit=limit, event_key=event_key,
+        severity=severity, device=device,
+    ))
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})

@@ -71,7 +71,7 @@ Environment variables for HTTP mode:
 | `get_device_ports` | Device port status, profiles/VLANs, PoE and traffic fields |
 | `get_active_clients` | Connected clients with signal, traffic, VLAN |
 | `get_known_clients` | All historically known clients |
-| `get_client_detail` | Full client record by exact name, MAC or IP, including SNR, rates and connection details |
+| `get_client_detail` | Client lookup by name, hostname, MAC or IP; exact matches preferred, unique partial names accepted |
 | `get_topology` | Network topology, links and device relationships |
 | `get_capabilities` | Controller-supported capabilities |
 | `list_read_resources` | Discover settings/status resources and their API paths |
@@ -81,7 +81,7 @@ Environment variables for HTTP mode:
 | `get_lan_networks` | LAN profiles with DHCP and gateway |
 | `get_alerts` | Site alerts: `resolved=false` active, `true` resolved, `null` both; configurable time range |
 | `get_alert_count` | Number of active alerts |
-| `get_events` | Site event logs with configurable time range |
+| `get_events` | Bounded event page: default 50 records/24h, max 100; page/key/severity/device filters |
 | `check_connection` | Verify reachability and authentication |
 | `get_usage_status` | DPI collection/logging, cropping and history retention |
 | `get_application_usage` | Statistics: categories and application upload/download totals |
@@ -95,6 +95,47 @@ Environment variables for HTTP mode:
 | `get_security_logs` | IDS/IPS threat detections (archived or unarchived) and IPS enable/settings |
 | `get_vpn_configs` | Modern site-to-site, VPN-server and VPN-client tables, IDs, types and capabilities |
 | `get_vpn_detail` | Full protocol-specific VPN configuration by name or ID, including IPsec/IKE fields where configured |
+| `get_ssid_detail` | Dedicated SSID security/PMF/band/VLAN/rate/MAC/schedule configuration |
+| `get_acl_rules` | Gateway/switch/AP ACLs with reference resolution, syslog/counter availability and switch bindings |
+| `get_rf_scan` | Existing AP RF scan results/status; never starts a scan |
+| `list_controller_resources` | Discover controller-level read sections |
+| `read_controller_resource` | Controller settings/certificate metadata, NTP, cloud, accounts/roles/MFA, auto-backup |
+
+### Secret masking and output annotations
+
+MCP JSON output recursively masks WLAN PSKs (`ssidOverrides` and `pskSetting`),
+portal passwords, Twilio SID/token settings, VPN private/shared keys, SMTP/RADIUS
+credentials, tokens and SNMP communities by default. Audit old/new-value blobs
+are masked as well. This happens at the output boundary; raw API-client responses
+are intended for internal processing, not direct display.
+
+Only explicit `include_secrets=true` on `get_device_detail`, `get_ssid_detail`,
+`get_vpn_detail`, `read_site_resource` or `read_controller_resource` opts that one
+call into plaintext values returned by Omada. This never changes later calls.
+
+Port `linkSpeed`/`maxSpeed` codes are preserved with additional `*Mbps`/`*Text`
+fields (1=10M, 2=100M, 3=1G, 4=2.5G, 5=10G, 6=5G, 7=25G, 8=100G, 9=40G).
+Code 0 remains unknown/auto rather than being reported as a measured speed.
+Configured speed and nested `portStatus` negotiated speed are separate fields.
+
+SSID responses add security-family, PMF and band labels. Detailed PSK mode depends
+on `versionPsk`, band and mode. Raw enum values are retained. AP `ssidOverrides`
+can contain placeholders, so use `get_ssid_detail` for configured SSID values.
+WAN `onlineDetection` describes configured probes, not measured health.
+
+### Bounded event queries (response-shape change)
+
+`get_events()` now returns an object with `data`, `page`, `limit`, `totalRows`,
+`has_more`, `next_page`, and a fixed `range`, instead of fetching every event.
+Default: last 24h, 50 rows; `limit` is capped at 100. Oversized rows are clipped
+and explicitly marked `truncated_fields`. The prior unbounded 30-day response
+could exceed MCP transport limits.
+
+`event_key`, `severity` and `device` (exact name/MAC) are applied locally to the
+bounded API page; severity is supplemented from notification definitions when
+missing. `totalRows` is the count **before** local filters. An empty filtered page
+may still have `next_page`: continue using the same returned `range`, `limit` and
+filters. This prevents a filtered request from silently scanning megabytes.
 
 ### VPN configuration
 
@@ -108,8 +149,7 @@ PPTP, OpenVPN, WireGuard and SSL VPN. Detail responses preserve the controller's
 protocol-specific fields, including IPsec peer/network definitions, IKE version,
 phase-1/phase-2 proposals and lifetimes where returned. L2TP's encryption setting
 is distinct from a standalone IPsec profile. These are configuration reads, not
-live tunnel-status queries. Responses can contain keys/passwords returned by the
-configured account.
+live tunnel-status queries. Keys/passwords are masked by default.
 
 Inventory and detail reads were live-verified with the Viewer account against
 configured WireGuard, L2TP and SSL VPN entries. No standalone IPsec profile was
@@ -186,6 +226,27 @@ Pass one of these names to `read_site_resource(resource, site=None)`:
 | `dpi_status` | DPI support/status (not application traffic history) |
 | `notifications` | Alert/event notification settings |
 | `wlans`, `ssids`, `lan_networks` | Full fields behind the corresponding summary tools |
+| `ip_groups`, `ip_port_groups`, `mac_groups`, `time_profiles` | ACL objects and schedule definitions |
+| `ssid_details`, `wireless_features`, `rrm`, `mac_auth` | Full SSID inventory, roaming/band steering/airtime, RRM and MAC authentication |
+| `attack_defense`, `mac_filter_settings`, `mac_filters`, `ip_mac_binding_settings`, `ip_mac_bindings` | Network Security settings and rules |
+| `url_filters`, `ap_url_filters`, `ips_settings` | Gateway/AP URL filters and IDS/IPS configuration |
+| `upnp`, `mdns`, `bonjour_profiles`, `ddns`, `lan_multicast`, `nat_alg`, `one_to_one_nat`, `disable_nat` | Services, multicast and NAT settings |
+| `site_settings`, `remote_logging`, `reboot_schedules`, `poe_schedules`, `upgrade_schedules` | Site settings, syslog and device schedules |
+| `vpn_users` | Modern VPN user table (credentials masked) |
+| `rogue_aps` | Existing Rogue AP detections; no scan triggered |
+| `device_account` | Device account settings, if the configured role is permitted |
+
+DHCP options remain in full `lan_networks`/WAN responses where returned. The
+SSID detail's `rateControl` contains minimum-rate settings, `wlanSchedule` its
+schedule, and `macFilter` its filtering configuration. `wireless_features` covers
+global roaming/band-steering; `rrm` covers automatic radio planning settings.
+
+Controller resources: `settings` (including certificate metadata), `general_ntp`,
+`cloud_access`, `users`, `roles`, `current_user_mfa`, and `auto_backup`.
+On the verified Viewer account, `device_account` and `auto_backup` return explicit
+permission errors; the other new resources were readable. RF scan results may
+only contain status if no scan has completed. Full certificate/key export and
+runtime ACL enforcement verification are not implemented.
 
 All site-level tools accept an optional `site` name or ID. Omit it to use
 `OMADA_SITE`, or the controller's default site if unset. Site selection is per
@@ -196,12 +257,18 @@ ACL tables are separate: an empty `gateway_custom_acls` table does not mean ther
 are no standard `gateway_acls`. Check `gateway_acl_mode` for mode metadata. The
 standard reader was verified against 14 gateway, 3 switch and 2 AP configured
 rules. Rule presence/enable flags alone do not prove enforcement on a device.
+The catalog now includes the `type` parameter for each standard ACL resource.
+`get_acl_rules(kind="gateway"|"switch"|"ap")` resolves network, IP/IP-port/MAC
+groups, SSIDs and time profiles, preserves syslog configuration, and distinguishes
+unsupported/missing hit counters from zero hits. Type 11 is **NOT network**, not
+"all destinations". Switch bindings decode 0=all ports, 1=custom ports,
+2=all switches, 3=custom switches. Candidate inventory ports and explicit custom
+selections are separate. Unresolved references and lookup errors remain visible.
 
 Detail/resource/topology/event tools return JSON preserving controller field names;
 existing inventory tools return concise summaries. API enum values are preserved.
-Log tools accept `start_ms` and `end_ms` (Unix milliseconds); the default range is
-the 30 days ending at `end_ms`, or now when omitted. Large ranges can return many
-records, so use a narrower range for focused troubleshooting.
+Log tools accept `start_ms` and `end_ms` (Unix milliseconds). Events default to
+24h and one bounded page; alerts/audit/security/incidents retain their 30-day range.
 
 Example questions this enables:
 - “Which switch ports supply PoE, and how much power are they using?”
@@ -214,8 +281,8 @@ The expanded endpoints were live-verified with a Viewer account on controller
 6.3.0.111. Availability and returned fields depend on controller version, hardware
 and account privileges. Unsupported/permission errors are surfaced as errors,
 not empty results. All exposed tools only read controller data; authentication
-and report computation use POST requests. Configuration responses may include sensitive
-values returned by Omada to the configured account.
+and report computation use POST requests. Sensitive configuration values are
+masked by default and available only through the explicit per-call opt-in above.
 
 ## Testing
 
