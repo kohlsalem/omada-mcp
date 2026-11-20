@@ -93,6 +93,27 @@ Environment variables for HTTP mode:
 | `get_incident_summary` | Incident counts by severity/category/status and current unresolved count |
 | `get_audit_logs` | Site administrator changes or controller audit activity, with operator, source IP and results |
 | `get_security_logs` | IDS/IPS threat detections (archived or unarchived) and IPS enable/settings |
+| `get_vpn_configs` | Modern site-to-site, VPN-server and VPN-client tables, IDs, types and capabilities |
+| `get_vpn_detail` | Full protocol-specific VPN configuration by name or ID, including IPsec/IKE fields where configured |
+
+### VPN configuration
+
+`get_vpn_configs(site=None, group=None)` reads all three VPN groups, or a selected
+`site_to_site`, `servers`, or `clients` group. `get_vpn_detail(name_or_id, site=None,
+group=None)` retrieves a full configuration by exact ID or case-insensitive name.
+Duplicate names require selecting an ID/group.
+
+The modern VPN endpoints cover standalone IPsec (`vpnType=2`) as well as L2TP,
+PPTP, OpenVPN, WireGuard and SSL VPN. Detail responses preserve the controller's
+protocol-specific fields, including IPsec peer/network definitions, IKE version,
+phase-1/phase-2 proposals and lifetimes where returned. L2TP's encryption setting
+is distinct from a standalone IPsec profile. These are configuration reads, not
+live tunnel-status queries. Responses can contain keys/passwords returned by the
+configured account.
+
+Inventory and detail reads were live-verified with the Viewer account against
+configured WireGuard, L2TP and SSL VPN entries. No standalone IPsec profile was
+present; preservation of its protocol-specific fields is covered by unit tests.
 
 ### Incidents, audit and security logs
 
@@ -153,7 +174,8 @@ Pass one of these names to `read_site_resource(resource, site=None)`:
 | Resources | Information |
 |---|---|
 | `wan` | WAN ports, settings, load balancing and status |
-| `gateway_acls` | Gateway firewall ACL rules |
+| `gateway_acls`, `switch_acls`, `ap_acls` | Standard gateway/switch/AP ACL rules (API types 0/1/2) |
+| `gateway_custom_acls`, `gateway_acl_mode` | Separate custom gateway rule table and configured ACL mode |
 | `port_forwarding`, `static_routes`, `policy_routes` | NAT and routing configuration |
 | `dhcp_reservations` | Fixed IP/MAC assignments |
 | `port_profiles`, `rate_limits` | Switch port/VLAN profiles and bandwidth profiles |
@@ -169,6 +191,11 @@ All site-level tools accept an optional `site` name or ID. Omit it to use
 `OMADA_SITE`, or the controller's default site if unset. Site selection is per
 request, so concurrent requests for different sites do not change one another's
 default. `get_alert_count` is controller-wide.
+
+ACL tables are separate: an empty `gateway_custom_acls` table does not mean there
+are no standard `gateway_acls`. Check `gateway_acl_mode` for mode metadata. The
+standard reader was verified against 14 gateway, 3 switch and 2 AP configured
+rules. Rule presence/enable flags alone do not prove enforcement on a device.
 
 Detail/resource/topology/event tools return JSON preserving controller field names;
 existing inventory tools return concise summaries. API enum values are preserved.

@@ -453,12 +453,16 @@ async def list_read_resources() -> str:
 async def read_site_resource(resource: str, site: str | None = None) -> str:
     """Read full JSON for a settings/status section. Use list_read_resources for names.
 
-    Includes wan, gateway_acls, port_forwarding, static_routes, policy_routes,
+    Includes wan, gateway_acls, switch_acls, ap_acls, gateway_custom_acls,
+    gateway_acl_mode, port_forwarding, static_routes, policy_routes,
     dhcp_reservations, port_profiles, rate_limits, vpn_pptp_l2tp, vpn_clients,
     ssl_vpn_server, dns_proxy, lan_dns, portals, switch_ports, poe, port_counters,
     dpi_status, notifications, wlans, ssids, and lan_networks.
     Fetches all pages of tables. Availability depends on hardware/version/role;
     API permission/unsupported errors are reported rather than treated as empty data.
+    gateway_acls reads standard rules; gateway_custom_acls is a separate table.
+    Check gateway_acl_mode before interpreting an empty table. These are configured
+    rules, not proof of enforcement; use device/config-sync status separately.
     """
     return _json(await _get_client().get_site_resource(resource, site))
 
@@ -473,6 +477,32 @@ async def get_capabilities() -> str:
 async def get_topology(site: str | None = None) -> str:
     """Read network topology, links, device relationships, and last update time as JSON."""
     return _json(await _get_client().get_topology(site))
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
+async def get_vpn_configs(site: str | None = None, group: str | None = None) -> str:
+    """List modern VPN configuration tables, IDs, types, enable flags and supported features.
+
+    group: site_to_site, servers, clients, or omit for all three. Includes IPsec,
+    L2TP, WireGuard, OpenVPN and SSL VPN where configured. Fetches all pages.
+    Use get_vpn_detail for peers, subnets, IKE/proposals and other full configuration fields.
+    """
+    return _json(await _get_client().get_vpn_configs(site, group))
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
+async def get_vpn_detail(
+    name_or_id: str, site: str | None = None, group: str | None = None,
+) -> str:
+    """Read full VPN configuration by exact name or ID, with case-insensitive name matching.
+
+    Optional group: site_to_site, servers, clients. Preserves protocol-specific
+    controller fields: IPsec/IKE phase-1/phase-2 proposals, remote/local networks,
+    peers, authentication/encryption and lifetimes where returned. L2TP encryption
+    is separate from standalone IPsec (vpnType=2). Configuration can include secret
+    values returned by the account. This is configuration, not live tunnel status.
+    """
+    return _json(await _get_client().get_vpn_detail(name_or_id, site, group))
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})

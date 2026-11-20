@@ -33,6 +33,7 @@ async def test_site_isolation_and_resource_pagination(client):
         if request.url.path.endswith("sites/basic"):
             return respond({"data": [{"id": "branch", "name": "Branch"}], "totalRows": 1})
         if "/sites/branch/" in request.url.path:
+            assert request.url.params["type"] == "0"
             page = int(request.url.params["currentPage"])
             return respond({"data": [{"id": page}], "totalRows": 2})
         assert "/sites/default/" in request.url.path
@@ -245,3 +246,59 @@ async def test_security_converts_milliseconds_and_reports_disabled_ips(client):
     assert result["ips_settings"]["enable"] is False
     assert result["data"] == []
     assert "does not establish" in result["note"]
+
+
+@pytest.mark.asyncio
+async def test_vpn_pagination_metadata_and_ipsec_detail(client):
+    def handler(request):
+        assert request.method == "GET"
+        assert "/openapi/v2/controller/sites/default/vpn/site-to-site-vpns" in request.url.path
+        if request.url.path.endswith("/vpn2"):
+            return respond({"id": "vpn2", "name": "Branch", "vpnType": 2,
+                            "keyExchangeVersion": 1, "phase1Proposal1": {"encryption": "aes256"},
+                            "phase2Proposal1": {"integrity": "sha256"}, "saLifetime2": 3600,
+                            "remoteSubnets": ["10.20.0.0/16"]})
+        page = int(request.url.params["page"])
+        return respond({"data": [{"id": f"vpn{page}", "name": "HQ" if page == 1 else "Branch", "vpnType": 2}],
+                        "totalRows": 2, "supportIPsec": True})
+
+    client._http = httpx.AsyncClient(base_url=client.base_url, transport=httpx.MockTransport(handler))
+    inventory = await client.get_vpn_configs(group="site_to_site")
+    assert len(inventory["groups"]["site_to_site"]["data"]) == 2
+    assert inventory["groups"]["site_to_site"]["supportIPsec"] is True
+    detail = await client.get_vpn_detail("bRaNcH", group="site_to_site")
+    assert detail["vpn_type"] == "IPsec"
+    assert detail["configuration"]["saLifetime2"] == 3600
+    assert detail["configuration"]["phase1Proposal1"]["encryption"] == "aes256"
+    with pytest.raises(ValueError, match="0 matches"):
+        await client.get_vpn_detail("missing", group="site_to_site")
+    with pytest.raises(ValueError, match="Unknown VPN group"):
+        await client.get_vpn_configs(group="../psk")
+
+
+@pytest.mark.asyncio
+async def test_vpn_duplicate_names_require_id_or_group(client):
+    def handler(request):
+        return respond({"data": [{"id": request.url.path.rsplit("/", 1)[-1], "name": "Office", "vpnType": 2}],
+                        "totalRows": 1})
+
+    client._http = httpx.AsyncClient(base_url=client.base_url, transport=httpx.MockTransport(handler))
+    with pytest.raises(ValueError, match="3 matches"):
+        await client.get_vpn_detail("Office")
+
+
+@pytest.mark.asyncio
+async def test_acl_resources_select_standard_type_and_keep_custom_separate(client):
+    def handler(request):
+        assert request.method == "GET"
+        if request.url.path.endswith("/firewall/acls"):
+            typ = int(request.url.params["type"])
+            return respond({"data": [{"type": typ, "name": "Configured rule"}], "totalRows": 1})
+        assert request.url.path.endswith("/firewall/gateway-acls")
+        assert "type" not in request.url.params
+        return respond({"data": [], "totalRows": 0})
+
+    client._http = httpx.AsyncClient(base_url=client.base_url, transport=httpx.MockTransport(handler))
+    for resource, typ in [("gateway_acls", 0), ("switch_acls", 1), ("ap_acls", 2)]:
+        assert (await client.get_site_resource(resource))[0]["type"] == typ
+    assert await client.get_site_resource("gateway_custom_acls") == []

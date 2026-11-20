@@ -18,7 +18,11 @@ logger = logging.getLogger(__name__)
 # The boolean indicates a paginated table rather than a single object/list.
 SITE_RESOURCES = {
     "wan": ("setting/wan/networks", False),
-    "gateway_acls": ("setting/firewall/gateway-acls", True),
+    "gateway_acls": ("setting/firewall/acls", True),
+    "switch_acls": ("setting/firewall/acls", True),
+    "ap_acls": ("setting/firewall/acls", True),
+    "gateway_custom_acls": ("setting/firewall/gateway-acls", True),
+    "gateway_acl_mode": ("setting/firewall/gateway-acls/config-mode", False),
     "port_forwarding": ("setting/transmission/portForwardings", True),
     "static_routes": ("setting/transmission/staticRoutings", True),
     "policy_routes": ("setting/transmission/policyRoutings", True),
@@ -50,6 +54,13 @@ REPORT_CARDS = (
     "topSsidByTraffic", "clientsOverview", "clientsAssociationActivities",
     "clientsWithOnboardingTimes", "appCategories", "topApplicationByTraffic",
 )
+
+VPN_GROUPS = {
+    "site_to_site": "site-to-site-vpns",
+    "servers": "client-to-site-vpn-servers",
+    "clients": "client-to-site-vpn-clients",
+}
+VPN_TYPES = {0: "L2TP", 1: "PPTP", 2: "IPsec", 3: "OpenVPN", 4: "WireGuard", 5: "SSL VPN"}
 
 
 class OmadaApiError(Exception):
@@ -372,10 +383,59 @@ class OmadaClient:
         if resource not in SITE_RESOURCES:
             raise ValueError(f"Unknown resource {resource!r}. Choose from: {', '.join(SITE_RESOURCES)}")
         endpoint, paginated = SITE_RESOURCES[resource]
-        return await self._read_site(endpoint, site, paginated=paginated)
+        acl_types = {"gateway_acls": 0, "switch_acls": 1, "ap_acls": 2}
+        params = {"type": acl_types[resource]} if resource in acl_types else None
+        return await self._read_site(endpoint, site, params=params, paginated=paginated)
 
     async def get_topology(self, site: str | None = None) -> dict:
         return await self._read_site("topology-v2", site)
+
+    async def get_vpn_configs(self, site: str | None = None, group: str | None = None) -> dict:
+        """Read modern VPN tables, retaining controller capability metadata."""
+        if group is not None and group not in VPN_GROUPS:
+            raise ValueError(f"Unknown VPN group. Choose from: {', '.join(VPN_GROUPS)}")
+        site_id = await self._resolve_site(site)
+        groups = [group] if group is not None else VPN_GROUPS
+        results = {}
+        for name in groups:
+            endpoint = VPN_GROUPS[name]
+            items = []
+            page = 1
+            while True:
+                result = await self._get(
+                    lambda: f"/openapi/v2/{self._omadac_id}/sites/{quote(site_id, safe='')}/vpn/{endpoint}",
+                    params={"page": page, "pageSize": 100},
+                )
+                if page == 1:
+                    metadata = {k: v for k, v in result.items()
+                                if k not in ("data", "currentPage", "currentSize")}
+                data = result.get("data", [])
+                items.extend(data)
+                if len(items) >= result.get("totalRows", 0) or not data:
+                    break
+                page += 1
+            results[name] = {**metadata, "data": items}
+        return {"groups": results, "vpn_types": VPN_TYPES}
+
+    async def get_vpn_detail(
+        self, name_or_id: str, site: str | None = None, group: str | None = None,
+    ) -> dict:
+        inventory = await self.get_vpn_configs(site, group)
+        matches = [(category, item) for category, table in inventory["groups"].items()
+                   for item in table["data"]
+                   if item.get("id") == name_or_id
+                   or (bool(item.get("name")) and item["name"].casefold() == name_or_id.casefold())]
+        if len(matches) != 1:
+            raise ValueError(f"VPN {name_or_id!r}: {len(matches)} matches. Use get_vpn_configs and select an ID/group.")
+        category, item = matches[0]
+        site_id = await self._resolve_site(site)
+        endpoint = VPN_GROUPS[category]
+        vpn_id = quote(item["id"], safe="")
+        detail = await self._get(
+            lambda: f"/openapi/v2/{self._omadac_id}/sites/{quote(site_id, safe='')}/vpn/{endpoint}/{vpn_id}",
+        )
+        return {"group": category, "vpn_type": VPN_TYPES.get(detail.get("vpnType"), "unknown"),
+                "configuration": detail}
 
     async def _read_openapi_site(
         self, endpoint: str, site: str | None = None, params: dict | None = None,

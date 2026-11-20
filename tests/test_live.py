@@ -150,3 +150,12 @@ class TestLiveController:
         assert "enable" in threats["ips_settings"]
         assert isinstance(threats["data"], list)
         assert isinstance((await client.get_security_logs(archived=True))["data"], list)
+
+    async def test_vpn_configuration_readers(self, client):
+        inventory = await client.get_vpn_configs()
+        assert set(inventory["groups"]) == {"site_to_site", "servers", "clients"}
+        for group, table in inventory["groups"].items():
+            for item in table["data"]:
+                result = await client.get_vpn_detail(item["id"], group=group)
+                assert result["configuration"]["id"] == item["id"]
+                assert result["configuration"]["vpnType"] == item["vpnType"]
