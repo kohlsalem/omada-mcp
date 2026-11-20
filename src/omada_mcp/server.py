@@ -14,7 +14,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
-from omada_mcp.client import OmadaClient, SITE_RESOURCES
+from omada_mcp.client import OmadaClient, SITE_RESOURCES, REPORT_CARDS
 
 # Logging to stderr only (stdout is JSON-RPC)
 logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(levelname)s %(name)s: %(message)s")
@@ -493,6 +493,132 @@ async def get_events(
 ) -> str:
     """Read all site event-log pages as JSON. Unix millisecond range defaults to last 30 days."""
     return _json(await _get_client().get_events(site, start_ms, end_ms))
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
+async def get_incidents(
+    site: str | None = None, start_ms: int | None = None,
+    end_ms: int | None = None, status: int | None = None,
+    search: str | None = None,
+) -> str:
+    """Read all incident pages, including causes/affected objects where returned, plus statistics.
+
+    Time range uses Unix milliseconds, default last 30 days. Omit status for all
+    statuses, or supply a controller enum value from returned data. Optional search
+    is passed to the controller. Does not acknowledge, resolve, ignore or delete incidents.
+    """
+    return _json(await _get_client().get_incidents(site, start_ms, end_ms, status, search))
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
+async def get_incident_summary(
+    site: str | None = None, start_ms: int | None = None,
+    end_ms: int | None = None, status: int | None = None,
+) -> str:
+    """Read incident counts by status, severity and category for a Unix millisecond range (default 30 days).
+
+    Omit status for all statuses. The separate active count is the current unresolved
+    count, independent of the requested historical window.
+    """
+    return _json(await _get_client().get_incident_summary(site, start_ms, end_ms, status))
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
+async def get_audit_logs(
+    site: str | None = None, start_ms: int | None = None,
+    end_ms: int | None = None, controller_wide: bool = False,
+    search: str | None = None,
+) -> str:
+    """Read administrator audit history: operator, source IP, action, result and change values where available.
+
+    Default is the selected site's audit log. Set controller_wide=true for controller
+    audit activity such as logins (a separate scope, not necessarily a superset of site
+    changes). Do not combine controller_wide with site. Unix millisecond range defaults
+    to last 30 days. Fetches all pages; optional search is server-side.
+    """
+    return _json(await _get_client().get_audit_logs(site, start_ms, end_ms, controller_wide, search))
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
+async def get_security_logs(
+    site: str | None = None, start_ms: int | None = None,
+    end_ms: int | None = None, archived: bool = False,
+    search: str | None = None,
+) -> str:
+    """Read IDS/IPS threat detections and IPS enable/settings. All pages, optional server-side search.
+
+    Unix millisecond range defaults to last 30 days. archived=false reads unarchived
+    detections; true reads archived ones. Empty data is not proof of no threats,
+    especially when IDS/IPS is disabled. Does not archive, block or modify detections.
+    """
+    return _json(await _get_client().get_security_logs(site, start_ms, end_ms, archived, search))
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
+async def get_usage_status(site: str | None = None) -> str:
+    """Check DPI support, enabled collection/logging, cropping and history retention before interpreting usage."""
+    return _json(await _get_client().get_usage_status(site))
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
+async def get_application_usage(
+    site: str | None = None, start: int | None = None, end: int | None = None,
+    family_ids: list[int] | None = None,
+) -> str:
+    """Statistics tab: traffic by category and all allowed applications, including upload/download bytes.
+
+    Range is Unix SECONDS (default last 24h). Optional family_ids restrict the application
+    table; overview remains site-wide. Returns category/application IDs for drilldowns.
+    DPI classifies services, not individual destination IPs/domains. Includes collection/retention status.
+    """
+    return _json(await _get_client().get_application_usage(site, start, end, family_ids))
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
+async def get_client_application_usage(
+    name_or_mac_or_ip: str, site: str | None = None,
+    start: int | None = None, end: int | None = None,
+) -> str:
+    """Read a client's historical DPI categories and application upload/download/packet totals.
+
+    Range is Unix SECONDS, default last 24h. Accepts historical MACs directly.
+    Cropped/disabled/expired data may be empty; never interpret that as zero usage.
+    """
+    return _json(await _get_client().get_client_application_usage(name_or_mac_or_ip, site, start, end))
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
+async def get_application_clients(
+    family_id: int, application_ids: list[int], site: str | None = None,
+    start: int | None = None, end: int | None = None,
+) -> str:
+    """Which clients used these applications? Use IDs from get_application_usage.
+
+    Range is Unix SECONDS, default last 24h. Returns all client table pages and DPI
+    collection/retention status. Cropped data may be empty, not proof of no usage.
+    """
+    return _json(await _get_client().get_application_clients(family_id, application_ids, site, start, end))
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
+async def list_report_cards() -> str:
+    """Discover historical Reports tab cards supported by get_report (traffic, clients, AP/switch/SSID/PoE/health)."""
+    return _json(REPORT_CARDS)
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
+async def get_report(
+    cards: list[str], site: str | None = None,
+    start: int | None = None, end: int | None = None, top_k: int = 20,
+) -> str:
+    """Read historical Reports tab cards. Discover names with list_report_cards.
+
+    Range is Unix SECONDS, default last 24h. Start with overviewSummary, internet,
+    network, clientConnectionTrend, topSsidByTraffic. Internet and all-network totals
+    are distinct scopes, not additive. Returns controller time-series and totals.
+    Uses a read-only report-query POST; does not save, export or schedule reports.
+    """
+    return _json(await _get_client().get_report(cards, site, start, end, top_k))
 
 
 # ═══════════════════════════════════════════════════════════════════

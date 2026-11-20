@@ -114,3 +114,134 @@ async def test_log_filters_and_errors(client):
         await client.get_site_resource("../cmd/reboot")
     with pytest.raises(OmadaApiError, match="Permission denied"):
         await client.get_site_resource("wan")
+
+
+@pytest.mark.asyncio
+async def test_usage_discovers_categories_paginates_and_preserves_crop_status(client):
+    def handler(request):
+        assert request.method == "GET"
+        path = request.url.path
+        if path.endswith("/overview"):
+            assert request.url.params["start"] == "1000"
+            return respond({"categoryTraffics": [{"familyId": 2097}], "totalTraffic": 300})
+        if path.endswith("application/stat"):
+            assert request.url.params["filters.family"] == "2097"
+            assert request.url.params["filters.type"] == "0"
+            page = int(request.url.params["currentPage"])
+            return respond({"totalRows": 2, "data": [{"applicationId": page, "up": 50, "down": 100}]})
+        return respond({"enableCrop": True, "showDataDays": 7})
+
+    client._http = httpx.AsyncClient(base_url=client.base_url, transport=httpx.MockTransport(handler))
+    result = await client.get_application_usage(start=1000, end=2000)
+    assert len(result["applications"]) == 2
+    assert result["status"]["retention"]["enableCrop"] is True
+    with pytest.raises(ValueError, match="not milliseconds"):
+        await client.get_application_usage(start=1795100000000, end=1795190000000)
+
+
+@pytest.mark.asyncio
+async def test_report_post_is_fixed_query_and_validates_cards(client):
+    seen = []
+
+    def handler(request):
+        import json
+
+        seen.append(request)
+        assert request.method == "POST"
+        assert request.url.path == "/openapi/v1/controller/sites/default/report/cards"
+        body = json.loads(request.content)
+        assert body == {"start": 1000, "end": 2000, "cards": [{"type": "internet", "topK": 5}]}
+        return respond({"internet": {"totalTraffic": 300, "activityList": [{"time": 1500}]}})
+
+    client._http = httpx.AsyncClient(base_url=client.base_url, transport=httpx.MockTransport(handler))
+    result = await client.get_report(["internet", "internet"], start=1000, end=2000, top_k=5)
+    assert result["cards"]["internet"]["totalTraffic"] == 300
+    with pytest.raises(ValueError, match="Choose report cards"):
+        await client.get_report(["../export-now-email"])
+    with pytest.raises(ValueError, match="top_k"):
+        await client.get_report(["internet"], top_k=1000)
+    assert len(seen) == 1
+
+
+@pytest.mark.asyncio
+async def test_historical_mac_usage_keeps_empty_result_distinct_from_zero(client):
+    paths = []
+
+    def handler(request):
+        paths.append(request.url.path)
+        assert request.method == "GET"
+        if request.url.path.endswith("applicationTrafficStat"):
+            assert "AA-BB-CC-DD-EE-FF" in request.url.path
+            assert request.url.params["filters.all"] == "true"
+            return respond({"data": [], "totalRows": 0})
+        return respond({"enableCrop": True})
+
+    client._http = httpx.AsyncClient(base_url=client.base_url, transport=httpx.MockTransport(handler))
+    result = await client.get_client_application_usage("aabb.ccdd.eeff", start=1000, end=2000)
+    assert result["applications"] == []
+    assert "do not establish zero" in result["note"]
+    assert not any(path.endswith("grid/devices") or path.endswith("insight/clients") for path in paths)
+
+
+@pytest.mark.asyncio
+async def test_incident_openapi_pagination_and_summary(client):
+    def handler(request):
+        assert request.method == "GET"
+        assert request.url.path.startswith("/openapi/v1/controller/sites/default/anomaly/")
+        if request.url.path.endswith("/incidents"):
+            assert request.url.params["filters.startTime"] == "1000"
+            assert request.url.params["filters.status"] == "3"
+            assert request.url.params["searchKey"] == "AP"
+            page = int(request.url.params["page"])
+            assert "currentPage" not in request.url.params
+            return respond({"data": [{"id": page}], "totalRows": 2, "statistic": {"warning": 2}})
+        if request.url.path.endswith("/statistics"):
+            assert "filters.status" not in request.url.params
+            return respond({"all": 2})
+        return respond({"activeNum": 1})
+
+    client._http = httpx.AsyncClient(base_url=client.base_url, transport=httpx.MockTransport(handler))
+    result = await client.get_incidents(start_ms=1000, end_ms=2000, status=3, search="AP")
+    assert result["data"] == [{"id": 1}, {"id": 2}]
+    assert result["statistic"]["warning"] == 2
+    summary = await client.get_incident_summary(start_ms=1000, end_ms=2000)
+    assert summary["active"]["activeNum"] == 1
+
+
+@pytest.mark.asyncio
+async def test_audit_time_filter_and_controller_scope(client):
+    import json
+
+    paths = []
+
+    def handler(request):
+        paths.append(request.url.path)
+        assert request.method == "GET"
+        assert json.loads(request.url.params["filters.times"]) == [{"timeStart": 1000, "timeEnd": 2000}]
+        assert request.url.params["searchKey"] == "admin"
+        return respond({"data": [{"operator": "admin"}], "totalRows": 1})
+
+    client._http = httpx.AsyncClient(base_url=client.base_url, transport=httpx.MockTransport(handler))
+    await client.get_audit_logs(start_ms=1000, end_ms=2000, search="admin")
+    await client.get_audit_logs(start_ms=1000, end_ms=2000, controller_wide=True, search="admin")
+    assert paths == ["/controller/api/v2/sites/default/audit/logs", "/controller/api/v2/audit/logs"]
+    with pytest.raises(ValueError, match="not both"):
+        await client.get_audit_logs(site="other", controller_wide=True)
+
+
+@pytest.mark.asyncio
+async def test_security_converts_milliseconds_and_reports_disabled_ips(client):
+    def handler(request):
+        assert request.method == "GET"
+        if request.url.path.endswith("setting/ips"):
+            return respond({"enable": False})
+        assert request.url.params["filters.startTime"] == "1"
+        assert request.url.params["filters.endTime"] == "2"
+        assert request.url.params["archived"] == "true"
+        return respond({"data": [], "totalRows": 0})
+
+    client._http = httpx.AsyncClient(base_url=client.base_url, transport=httpx.MockTransport(handler))
+    result = await client.get_security_logs(start_ms=1000, end_ms=2000, archived=True)
+    assert result["ips_settings"]["enable"] is False
+    assert result["data"] == []
+    assert "does not establish" in result["note"]

@@ -121,3 +121,32 @@ class TestLiveController:
             assert detail["mac"] == clients[0]["mac"]
         assert "topologyArray" in await client.get_topology(site)
         assert isinstance(await client.get_events(site), list)
+
+    async def test_usage_and_reports(self, client):
+        usage = await client.get_application_usage()
+        assert "categoryTraffics" in usage["overview"]
+        assert isinstance(usage["applications"], list)
+        assert "retention" in usage["status"]
+        if usage["applications"]:
+            app = usage["applications"][0]
+            attribution = await client.get_application_clients(app["familyId"], [app["applicationId"]])
+            assert isinstance(attribution["clients"], list)
+        clients = await client.get_active_clients()
+        if clients:
+            attribution = await client.get_client_application_usage(clients[0]["mac"])
+            assert isinstance(attribution["applications"], list)
+        report = await client.get_report(["overviewSummary", "internet", "clientConnectionTrend"])
+        assert "totalTraffic" in report["cards"]["internet"]
+
+    async def test_incident_audit_security_readers(self, client):
+        incidents = await client.get_incidents()
+        assert isinstance(incidents["data"], list)
+        summary = await client.get_incident_summary()
+        assert "statistics" in summary
+        assert "activeNum" in summary["active"]
+        assert isinstance(await client.get_audit_logs(), list)
+        assert isinstance(await client.get_audit_logs(controller_wide=True), list)
+        threats = await client.get_security_logs()
+        assert "enable" in threats["ips_settings"]
+        assert isinstance(threats["data"], list)
+        assert isinstance((await client.get_security_logs(archived=True))["data"], list)

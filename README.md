@@ -83,6 +83,68 @@ Environment variables for HTTP mode:
 | `get_alert_count` | Number of active alerts |
 | `get_events` | Site event logs with configurable time range |
 | `check_connection` | Verify reachability and authentication |
+| `get_usage_status` | DPI collection/logging, cropping and history retention |
+| `get_application_usage` | Statistics: categories and application upload/download totals |
+| `get_client_application_usage` | A client's historical application/category traffic where available |
+| `get_application_clients` | Clients responsible for selected applications, where available |
+| `list_report_cards` | Discover 25 historical report cards |
+| `get_report` | Reports: historical traffic, client trends, AP/switch/SSID/PoE/health summaries |
+| `get_incidents` | All incident pages with optional status/search filtering and returned statistics |
+| `get_incident_summary` | Incident counts by severity/category/status and current unresolved count |
+| `get_audit_logs` | Site administrator changes or controller audit activity, with operator, source IP and results |
+| `get_security_logs` | IDS/IPS threat detections (archived or unarchived) and IPS enable/settings |
+
+### Incidents, audit and security logs
+
+These tools accept optional `site`, `start_ms`, and `end_ms` (Unix milliseconds,
+default last 30 days), and fetch all matching table pages. Incident and audit
+results preserve controller fields. Incidents accept an optional raw `status`
+enum from the controller; omit it for all statuses. Incident lists, audit logs
+and security logs support server-side `search`.
+
+`get_audit_logs()` reads the default site's change history. Use
+`get_audit_logs(controller_wide=True)` for controller activity such as logins.
+These are separate scopes; controller activity is not a superset of site changes.
+`get_security_logs(archived=True)` reads archived detections; the default is
+unarchived. The reader converts its millisecond inputs to the seconds required
+by the threat API. The incident summary's `active` count is current, independent
+of the historical filter.
+
+Live verification returned populated audit records. Incidents were empty and
+the IDS/IPS setting reported `enable=false`, with empty threat logs. An empty
+security log does not establish that no threats occurred. No tools acknowledge,
+resolve, archive or delete entries, or enable detection.
+
+### Usage analytics and reports
+
+Analytics tools use `start` and `end` in **Unix seconds**, defaulting to the last
+24 hours. Log tools use milliseconds (`start_ms`/`end_ms`).
+
+- `get_application_usage()` returns the Statistics tab's site-wide category totals
+  and all allowed-application table pages, including upload/download byte counts.
+  Optional `family_ids` restrict the application table. Its overview stays site-wide.
+- Use category/application IDs from that response with `get_application_clients`
+  to request attribution, or `get_client_application_usage` for a named client,
+  IP or MAC. Historical MACs work without a current inventory record.
+- `get_report(cards=["overviewSummary", "internet", "clientConnectionTrend"])`
+  retrieves Reports tab totals and time series. `list_report_cards()` also lists
+  wired/wireless, AP, switch, SSID, PoE and client onboarding cards.
+
+Every DPI usage result includes collection and crop/retention status. On the
+verified controller, site-wide application traffic is populated but per-client
+DPI queries returned empty data, with `enableCrop=true` and `showDataDays=7`.
+Empty attribution results do **not** establish zero usage. Reports may likewise
+have empty DPI cards even while the Statistics tab has application data.
+
+DPI identifies application/service classes, not individual destination IPs,
+domains or connection flows. Internet, all-network and DPI totals cover distinct
+scopes and should not be added together. The controller's totals, timestamps and
+enum values are preserved rather than reinterpreted.
+
+Report reads use the web UI's fixed `POST .../report/cards` query endpoint. This
+computes data without saving, exporting or scheduling reports; all MCP tools
+remain read-only. The client sends `Omada-Request-Source: web-local`, required by
+the controller's session-authenticated OpenAPI endpoints.
 
 ### Configuration and status resources
 
@@ -125,7 +187,7 @@ The expanded endpoints were live-verified with a Viewer account on controller
 6.3.0.111. Availability and returned fields depend on controller version, hardware
 and account privileges. Unsupported/permission errors are surfaced as errors,
 not empty results. All exposed tools only read controller data; authentication
-uses the controller's login POST. Configuration responses may include sensitive
+and report computation use POST requests. Configuration responses may include sensitive
 values returned by Omada to the configured account.
 
 ## Testing

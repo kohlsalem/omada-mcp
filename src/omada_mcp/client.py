@@ -1,6 +1,7 @@
 """Omada Controller API client wrapping httpx.AsyncClient."""
 
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -39,6 +40,16 @@ SITE_RESOURCES = {
     "ssids": ("setting/ssids", False),
     "lan_networks": ("setting/lan/networks", True),
 }
+
+REPORT_CARDS = (
+    "overviewSummary", "clientConnectionTrend", "internet", "network", "alertSummary",
+    "gatewaySummary", "ispLoad", "switchHealthTrend", "switchStatus",
+    "topSwitchByTrafficAndPoePower", "topSwitchCpuMemory", "poePowerTrend",
+    "wirelessTraffic", "apHealth", "apStatus", "topApByTrafficAndClient",
+    "topApByRtAndDrop", "topApByInterference", "topApByCpuAndMemory",
+    "topSsidByTraffic", "clientsOverview", "clientsAssociationActivities",
+    "clientsWithOnboardingTimes", "appCategories", "topApplicationByTraffic",
+)
 
 
 class OmadaApiError(Exception):
@@ -83,6 +94,7 @@ class OmadaClient:
             verify=not skip_tls_verify,
             timeout=30.0,
             follow_redirects=True,
+            headers={"Omada-Request-Source": "web-local"},
         )
         self._authenticated = False
         self._csrf_token: str = ""
@@ -241,10 +253,12 @@ class OmadaClient:
             raise OmadaApiError(data["errorCode"], data.get("msg", "Unknown error"))
         return data["result"]
 
-    async def _post(self, path: str, json: Any = None) -> dict[str, Any]:
+    async def _post(self, path: str | Any, json: Any = None) -> dict[str, Any]:
         """POST request with auth, error handling, and session recovery."""
         await self._ensure_auth()
-        resp = await self._request_with_retry("POST", path, json=json)
+        build_path = path if callable(path) else lambda: path
+        request_path = build_path()
+        resp = await self._request_with_retry("POST", request_path, json=json)
         self._raise_for_status(resp)
 
         content_type = resp.headers.get("content-type", "")
@@ -252,7 +266,7 @@ class OmadaClient:
             logger.warning("Session expired, re-authenticating...")
             self._authenticated = False
             await self._login()
-            resp = await self._request_with_retry("POST", path, json=json)
+            resp = await self._request_with_retry("POST", build_path(), json=json)
             self._raise_for_status(resp)
 
         data = resp.json()
@@ -362,6 +376,192 @@ class OmadaClient:
 
     async def get_topology(self, site: str | None = None) -> dict:
         return await self._read_site("topology-v2", site)
+
+    async def _read_openapi_site(
+        self, endpoint: str, site: str | None = None, params: dict | None = None,
+    ) -> Any:
+        site_id = await self._resolve_site(site)
+        return await self._get(
+            lambda: f"/openapi/v1/{self._omadac_id}/sites/{quote(site_id, safe='')}/{endpoint}",
+            params=params,
+        )
+
+    @staticmethod
+    def _incident_filters(
+        start_ms: int | None, end_ms: int | None, status: int | None,
+    ) -> dict:
+        window = OmadaClient._time_filters(start_ms, end_ms)
+        params = {"filters.startTime": window["filters.timeStart"],
+                  "filters.endTime": window["filters.timeEnd"]}
+        if status is not None:
+            params["filters.status"] = status
+        return params
+
+    async def get_incidents(
+        self, site: str | None = None, start_ms: int | None = None,
+        end_ms: int | None = None, status: int | None = None,
+        search: str | None = None,
+    ) -> dict:
+        params = self._incident_filters(start_ms, end_ms, status)
+        if search:
+            params["searchKey"] = search
+        items = []
+        page = 1
+        first = None
+        while True:
+            result = await self._read_openapi_site(
+                "anomaly/incidents", site, {**params, "page": page, "pageSize": 100},
+            )
+            if first is None:
+                first = result
+            data = result.get("data", [])
+            items.extend(data)
+            if len(items) >= result.get("totalRows", 0) or not data:
+                break
+            page += 1
+        return {"data": items, "totalRows": first.get("totalRows", 0),
+                "statistic": first.get("statistic", {}), "filters": params}
+
+    async def get_incident_summary(
+        self, site: str | None = None, start_ms: int | None = None,
+        end_ms: int | None = None, status: int | None = None,
+    ) -> dict:
+        params = self._incident_filters(start_ms, end_ms, status)
+        return {
+            "filters": params,
+            "statistics": await self._read_openapi_site("anomaly/overview/statistics", site, params),
+            "active": await self._read_openapi_site("anomaly/unresolved-incidents", site),
+        }
+
+    async def get_audit_logs(
+        self, site: str | None = None, start_ms: int | None = None,
+        end_ms: int | None = None, controller_wide: bool = False,
+        search: str | None = None,
+    ) -> list[dict]:
+        if controller_wide and site is not None:
+            raise ValueError("Specify either site or controller_wide, not both.")
+        window = self._time_filters(start_ms, end_ms)
+        params = {"filters.times": json.dumps([{
+            "timeStart": window["filters.timeStart"], "timeEnd": window["filters.timeEnd"],
+        }])}
+        if search:
+            params["searchKey"] = search
+        if controller_wide:
+            return await self._get_all_pages(lambda: self._controller_path("audit/logs"), params=params)
+        return await self._read_site("audit/logs", site, params=params, paginated=True)
+
+    async def get_security_logs(
+        self, site: str | None = None, start_ms: int | None = None,
+        end_ms: int | None = None, archived: bool = False,
+        search: str | None = None,
+    ) -> dict:
+        window = self._time_filters(start_ms, end_ms)
+        params = {
+            "filters.startTime": window["filters.timeStart"] // 1000,
+            "filters.endTime": window["filters.timeEnd"] // 1000,
+            "archived": str(archived).lower(),
+        }
+        if search:
+            params["searchKey"] = search
+        return {
+            "filters": params,
+            "ips_settings": await self._read_site("setting/ips", site),
+            "data": await self._read_site("ips/threat-management", site, params=params, paginated=True),
+            "note": "An empty threat log does not establish absence of threats; check IDS/IPS enable status and retention.",
+        }
+
+    @staticmethod
+    def _usage_range(start: int | None, end: int | None) -> dict:
+        end = int(time.time()) if end is None else end
+        start = end - 86400 if start is None else start
+        if not 0 <= start < end < 100_000_000_000:
+            raise ValueError("Usage range must be 0 <= start < end in Unix seconds, not milliseconds.")
+        return {"start": start, "end": end}
+
+    async def get_usage_status(self, site: str | None = None) -> dict:
+        return {
+            "capabilities": await self._read_site("dpi/status", site),
+            "collection": await self._read_site("applicationControl/status", site),
+            "retention": await self._read_site("stat/dpi/crop", site),
+        }
+
+    async def get_application_usage(
+        self, site: str | None = None, start: int | None = None, end: int | None = None,
+        family_ids: list[int] | None = None,
+    ) -> dict:
+        window = self._usage_range(start, end)
+        overview = await self._read_site("stat/dpi/overview", site, params=window)
+        families = family_ids if family_ids is not None else [
+            c["familyId"] for c in overview.get("categoryTraffics", []) if c.get("familyId") is not None
+        ]
+        applications = []
+        if families:
+            applications = await self._read_site(
+                "stat/dpi/application/stat", site, paginated=True,
+                params={**window, "filters.family": ",".join(map(str, families)), "filters.type": 0},
+            )
+        return {"range": window, "overview": overview, "applications": applications,
+                "status": await self.get_usage_status(site)}
+
+    async def get_client_application_usage(
+        self, name_or_mac_or_ip: str, site: str | None = None,
+        start: int | None = None, end: int | None = None,
+    ) -> dict:
+        window = self._usage_range(start, end)
+        # A known MAC may have traffic history even when absent from today's inventory.
+        mac = name_or_mac_or_ip.replace(":", "").replace("-", "").replace(".", "")
+        if len(mac) == 12 and all(ch in "0123456789abcdefABCDEF" for ch in mac):
+            mac = "-".join(mac[i:i + 2] for i in range(0, 12, 2)).upper()
+            client = {"mac": mac}
+        else:
+            client = await self.get_client_detail(name_or_mac_or_ip, site)
+            mac = client["mac"]
+        prefix = f"stat/dpi/clients/{quote(mac, safe='')}"
+        return {
+            "client": {k: client[k] for k in ("mac", "name", "ip") if k in client},
+            "range": window,
+            "categories": await self._read_site(f"{prefix}/categoryTraffic", site, params=window),
+            "applications": await self._read_site(
+                f"{prefix}/applicationTrafficStat", site, paginated=True,
+                params={**window, "filters.all": "true"},
+            ),
+            "status": await self.get_usage_status(site),
+            "note": "Empty DPI records do not establish zero usage. Check collection and crop/retention status.",
+        }
+
+    async def get_application_clients(
+        self, family_id: int, application_ids: list[int], site: str | None = None,
+        start: int | None = None, end: int | None = None,
+    ) -> dict:
+        window = self._usage_range(start, end)
+        if family_id < 0 or not application_ids or any(i < 0 for i in application_ids):
+            raise ValueError("Provide a nonnegative family_id and at least one nonnegative application ID.")
+        return {
+            "range": window,
+            "clients": await self._read_site(
+                f"stat/dpi/{family_id}/clientTraffic", site, paginated=True,
+                params={**window, "filters.application": ",".join(map(str, application_ids))},
+            ),
+            "status": await self.get_usage_status(site),
+            "note": "Empty DPI records do not establish zero usage. Check collection and crop/retention status.",
+        }
+
+    async def get_report(
+        self, cards: list[str], site: str | None = None,
+        start: int | None = None, end: int | None = None, top_k: int = 20,
+    ) -> dict:
+        window = self._usage_range(start, end)
+        if not cards or any(card not in REPORT_CARDS for card in cards):
+            raise ValueError(f"Choose report cards from: {', '.join(REPORT_CARDS)}")
+        if not 1 <= top_k <= 100:
+            raise ValueError("top_k must be between 1 and 100")
+        site_id = await self._resolve_site(site)
+        # This specific POST computes report data; it does not save/export/schedule a report.
+        data = await self._post(
+            lambda: f"/openapi/v1/{self._omadac_id}/sites/{quote(site_id, safe='')}/report/cards",
+            {**window, "cards": [{"type": card, "topK": top_k} for card in dict.fromkeys(cards)]},
+        )
+        return {"range": window, "cards": data}
 
     @staticmethod
     def _identity_matches(item: dict, query: str) -> bool:
