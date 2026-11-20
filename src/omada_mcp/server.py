@@ -1,6 +1,7 @@
 """Omada MCP Server — tools for monitoring and managing an Omada Controller."""
 
 import base64
+import json
 import logging
 import os
 import secrets
@@ -13,7 +14,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
-from omada_mcp.client import OmadaClient
+from omada_mcp.client import OmadaClient, SITE_RESOURCES
 
 # Logging to stderr only (stdout is JSON-RPC)
 logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(levelname)s %(name)s: %(message)s")
@@ -86,7 +87,9 @@ mcp = FastMCP(
     instructions=(
         "MCP server for TP-Link Omada Controller. "
         "Provides access to network monitoring, device status, client information, "
-        "WiFi channel analysis, LAN/WLAN configuration, and alerts."
+        "WiFi analysis, topology, ports/PoE, WAN/firewall/routing/VPN/DNS settings, and logs. "
+        "All tools are read-only. Use list_read_resources to discover configuration sections. "
+        "Site-aware tools accept a site name or ID; omit it for the configured default."
     ),
     lifespan=_lifespan,
 )
@@ -166,9 +169,9 @@ async def get_user_info() -> str:
 
 
 @mcp.tool()
-async def get_network_overview() -> str:
+async def get_network_overview(site: str | None = None) -> str:
     """Get full network health snapshot: gateway health, WAN ports, switch/AP/client counts, and power consumption."""
-    d = await _get_client().get_dashboard_overview()
+    d = await _get_client().get_dashboard_overview(site)
 
     # Gateway info
     gw_health = d.get("gatewayHealth", {})
@@ -192,9 +195,9 @@ async def get_network_overview() -> str:
 
 
 @mcp.tool()
-async def get_wifi_channels() -> str:
+async def get_wifi_channels(site: str | None = None) -> str:
     """Get WiFi channel utilization across 2.4 GHz, 5 GHz, and 6 GHz bands."""
-    data = await _get_client().get_wifi_channels()
+    data = await _get_client().get_wifi_channels(site)
     lines = ["WiFi Channel Utilization:"]
 
     for band_key, band_label in [("channels2g", "2.4 GHz"), ("channels5g", "5 GHz"), ("channels6g", "6 GHz")]:
@@ -245,9 +248,9 @@ async def check_connection() -> str:
 
 
 @mcp.tool()
-async def get_devices() -> str:
+async def get_devices(site: str | None = None) -> str:
     """List all network devices (gateways, switches, APs) with status, CPU/mem, firmware, and client count."""
-    devices = await _get_client().get_devices()
+    devices = await _get_client().get_devices(site)
     if not devices:
         return "No devices found."
 
@@ -266,31 +269,9 @@ async def get_devices() -> str:
 
 
 @mcp.tool()
-async def get_device_detail(name_or_mac: str) -> str:
-    """Get detailed info for a single device by name or MAC address."""
-    devices = await _get_client().get_devices()
-    search = name_or_mac.lower()
-
-    for d in devices:
-        if d.get("name", "").lower() == search or d.get("mac", "").lower() == search.lower():
-            status = "online" if d.get("statusCategory") == 1 else "offline"
-            download = _fmt_bytes(d.get("download", 0))
-            upload = _fmt_bytes(d.get("upload", 0))
-            return (
-                f"Device: {d.get('name', '?')}\n"
-                f"  Type: {d.get('type', '?')}  Model: {d.get('showModel', d.get('model', '?'))}\n"
-                f"  Firmware: {d.get('firmwareVersion', '?')}  HW: {d.get('hwVersion', '?')}\n"
-                f"  IP: {d.get('ip', '?')}  MAC: {d.get('mac', '?')}  SN: {d.get('sn', '?')}\n"
-                f"  Status: {status}  CPU: {d.get('cpuUtil', '?')}%  Mem: {d.get('memUtil', '?')}%\n"
-                f"  Uptime: {d.get('uptime', '?')}\n"
-                f"  Clients: {d.get('clientNum', '?')}\n"
-                f"  Traffic: Down {download}  Up {upload}\n"
-                f"  Config Sync: {d.get('configSyncStatus', '?')}\n"
-                f"  Upgrade needed: {d.get('needUpgrade', False)}\n"
-                f"  Locate enabled: {d.get('locateEnable', False)}"
-            )
-
-    return f"Device '{name_or_mac}' not found."
+async def get_device_detail(name_or_mac: str, site: str | None = None) -> str:
+    """Read full device configuration/status: AP radios/uplink, switch STP/PoE, or gateway ports."""
+    return _json(await _get_client().get_device_detail(name_or_mac, site))
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -299,9 +280,9 @@ async def get_device_detail(name_or_mac: str) -> str:
 
 
 @mcp.tool()
-async def get_active_clients() -> str:
+async def get_active_clients(site: str | None = None) -> str:
     """List all currently connected clients with IP, MAC, SSID, signal, traffic, and VLAN."""
-    clients = await _get_client().get_active_clients()
+    clients = await _get_client().get_active_clients(site)
 
     if not clients:
         return "No active clients."
@@ -329,9 +310,9 @@ async def get_active_clients() -> str:
 
 
 @mcp.tool()
-async def get_known_clients() -> str:
+async def get_known_clients(site: str | None = None) -> str:
     """List all historically known clients (active and inactive) with MAC, last seen, and traffic totals."""
-    clients = await _get_client().get_known_clients()
+    clients = await _get_client().get_known_clients(site)
 
     if not clients:
         return "No known clients."
@@ -359,9 +340,9 @@ async def get_known_clients() -> str:
 
 
 @mcp.tool()
-async def get_wlans() -> str:
+async def get_wlans(site: str | None = None) -> str:
     """List WLAN groups with name, primary flag, and max SSIDs per band."""
-    data = await _get_client().get_wlans()
+    data = await _get_client().get_wlans(site)
     wlans = data.get("data", [])
     if not wlans:
         return "No WLAN groups found."
@@ -376,9 +357,9 @@ async def get_wlans() -> str:
 
 
 @mcp.tool()
-async def get_ssids() -> str:
+async def get_ssids(site: str | None = None) -> str:
     """List all SSIDs with their VLAN assignments, grouped by WLAN."""
-    data = await _get_client().get_ssids()
+    data = await _get_client().get_ssids(site)
     wlans = data.get("ssids", [])
     if not wlans:
         return "No SSIDs found."
@@ -404,9 +385,9 @@ async def get_ssids() -> str:
 
 
 @mcp.tool()
-async def get_lan_networks() -> str:
+async def get_lan_networks(site: str | None = None) -> str:
     """List LAN network profiles with VLAN, gateway/subnet, DHCP settings, and domain."""
-    networks = await _get_client().get_lan_networks()
+    networks = await _get_client().get_lan_networks(site)
     if not networks:
         return "No LAN networks found."
 
@@ -434,12 +415,17 @@ async def get_lan_networks() -> str:
 
 
 @mcp.tool()
-async def get_alerts(resolved: bool = False) -> str:
-    """Get site alerts. Set resolved=true to include resolved alerts."""
-    alerts = await _get_client().get_alerts(resolved=resolved)
+async def get_alerts(
+    resolved: bool | None = False, site: str | None = None,
+    start_ms: int | None = None, end_ms: int | None = None,
+) -> str:
+    """Read alerts: false=active, true=resolved, null=both. Unix millisecond range defaults to last 30 days."""
+    alerts = await _get_client().get_alerts(
+        resolved=resolved, site=site, start_ms=start_ms, end_ms=end_ms,
+    )
 
     if not alerts:
-        return f"No {'resolved ' if resolved else 'active '}alerts."
+        return "No matching alerts."
 
     lines = [f"Alerts ({len(alerts)}):"]
     for a in alerts:
@@ -449,6 +435,64 @@ async def get_alerts(resolved: bool = False) -> str:
         )
 
     return "\n".join(lines)
+
+
+# Detailed readers preserve controller fields rather than guessing model-specific schemas.
+def _json(data) -> str:
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
+async def list_read_resources() -> str:
+    """Discover settings/status sections supported by read_site_resource, with API paths."""
+    return _json({name: {"endpoint": path, "paginated": paginated}
+                  for name, (path, paginated) in SITE_RESOURCES.items()})
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
+async def read_site_resource(resource: str, site: str | None = None) -> str:
+    """Read full JSON for a settings/status section. Use list_read_resources for names.
+
+    Includes wan, gateway_acls, port_forwarding, static_routes, policy_routes,
+    dhcp_reservations, port_profiles, rate_limits, vpn_pptp_l2tp, vpn_clients,
+    ssl_vpn_server, dns_proxy, lan_dns, portals, switch_ports, poe, port_counters,
+    dpi_status, notifications, wlans, ssids, and lan_networks.
+    Fetches all pages of tables. Availability depends on hardware/version/role;
+    API permission/unsupported errors are reported rather than treated as empty data.
+    """
+    return _json(await _get_client().get_site_resource(resource, site))
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
+async def get_capabilities() -> str:
+    """Read controller capabilities to identify supported features."""
+    return _json(await _get_client().get_capabilities())
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
+async def get_topology(site: str | None = None) -> str:
+    """Read network topology, links, device relationships, and last update time as JSON."""
+    return _json(await _get_client().get_topology(site))
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
+async def get_device_ports(name_or_mac: str, site: str | None = None) -> str:
+    """Read device ports including available link, VLAN/profile, PoE and traffic fields."""
+    return _json(await _get_client().get_device_ports(name_or_mac, site))
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
+async def get_client_detail(name_or_mac_or_ip: str, site: str | None = None) -> str:
+    """Find a client by exact name, MAC or IP; read signal/SNR, AP/switch, rates, VLAN, IP settings and status."""
+    return _json(await _get_client().get_client_detail(name_or_mac_or_ip, site))
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
+async def get_events(
+    site: str | None = None, start_ms: int | None = None, end_ms: int | None = None,
+) -> str:
+    """Read all site event-log pages as JSON. Unix millisecond range defaults to last 30 days."""
+    return _json(await _get_client().get_events(site, start_ms, end_ms))
 
 
 # ═══════════════════════════════════════════════════════════════════

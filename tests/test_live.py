@@ -10,7 +10,7 @@ import pytest_asyncio
 from pathlib import Path
 from dotenv import load_dotenv
 
-from omada_mcp.client import OmadaClient
+from omada_mcp.client import OmadaClient, SITE_RESOURCES
 
 # Load .env from project root
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
@@ -101,3 +101,23 @@ class TestLiveController:
         alerts = await client.get_alerts()
         assert isinstance(alerts, list)
         print(f"  Alerts: {len(alerts)}")
+
+    @pytest.mark.parametrize("resource", SITE_RESOURCES)
+    async def test_read_resources(self, client, resource):
+        result = await client.get_site_resource(resource)
+        assert isinstance(result, (dict, list))
+
+    async def test_detailed_readers(self, client):
+        sites = await client.get_sites()
+        site = sites["data"][0]["id"]
+        devices = await client.get_devices(site)
+        for device in devices:
+            detail = await client.get_device_detail(device["mac"], site)
+            assert detail["mac"] == device["mac"]
+            assert isinstance(await client.get_device_ports(device["mac"], site), list)
+        clients = await client.get_active_clients(site)
+        if clients:
+            detail = await client.get_client_detail(clients[0]["mac"], site)
+            assert detail["mac"] == clients[0]["mac"]
+        assert "topologyArray" in await client.get_topology(site)
+        assert isinstance(await client.get_events(site), list)

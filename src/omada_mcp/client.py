@@ -6,11 +6,39 @@ import os
 import sys
 import time
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 from dotenv import find_dotenv, load_dotenv
 
 logger = logging.getLogger(__name__)
+
+# Paths verified against the controller's web client and read-only API.
+# The boolean indicates a paginated table rather than a single object/list.
+SITE_RESOURCES = {
+    "wan": ("setting/wan/networks", False),
+    "gateway_acls": ("setting/firewall/gateway-acls", True),
+    "port_forwarding": ("setting/transmission/portForwardings", True),
+    "static_routes": ("setting/transmission/staticRoutings", True),
+    "policy_routes": ("setting/transmission/policyRoutings", True),
+    "dhcp_reservations": ("setting/service/dhcp", True),
+    "port_profiles": ("setting/lan/profiles", True),
+    "rate_limits": ("setting/profiles/rateLimits", False),
+    "vpn_pptp_l2tp": ("setting/vpns/pptpAndL2tp", False),
+    "vpn_clients": ("setting/vpns/c2s-client", False),
+    "ssl_vpn_server": ("setting/sslvpn/server", False),
+    "dns_proxy": ("setting/dns-proxy", False),
+    "lan_dns": ("setting/lan/dns", True),
+    "portals": ("setting/portals", False),
+    "switch_ports": ("insight/switch/port/overview", True),
+    "poe": ("insight/switch/port/poe", True),
+    "port_counters": ("insight/switch/port/counters", True),
+    "dpi_status": ("dpi/status", False),
+    "notifications": ("logs/notification", False),
+    "wlans": ("setting/wlans", False),
+    "ssids": ("setting/ssids", False),
+    "lan_networks": ("setting/lan/networks", True),
+}
 
 
 class OmadaApiError(Exception):
@@ -110,6 +138,10 @@ class OmadaClient:
                     if s["name"].lower() == self._site_name.lower() or s["id"] == self._site_name:
                         self._site_id = s["id"]
                         break
+                else:
+                    raise ValueError(f"Omada site {self._site_name!r} not found")
+            else:
+                raise OmadaApiError(sites_data["errorCode"], sites_data.get("msg", "Site lookup failed"))
 
         self._authenticated = True
         logger.info("Authenticated as %s (site: %s)", self.username, self._site_id)
@@ -126,6 +158,27 @@ class OmadaClient:
     def _site_path(self, endpoint: str) -> str:
         """Build a site-level API path."""
         return f"/{self._omadac_id}/api/v2/sites/{self._site_id}/{endpoint}"
+
+    async def _resolve_site(self, site: str | None = None) -> str:
+        """Resolve a site per request without changing shared client state."""
+        await self._ensure_auth()
+        if site is None:
+            return self._site_id
+        sites = await self.get_sites()
+        for item in sites.get("data", []):
+            if item["id"] == site or item["name"].casefold() == site.casefold():
+                return item["id"]
+        raise ValueError(f"Omada site {site!r} not found. Use get_sites to list sites.")
+
+    async def _read_site(
+        self, endpoint: str, site: str | None = None, *,
+        params: dict | None = None, paginated: bool = False,
+    ) -> Any:
+        site_id = await self._resolve_site(site)
+        path = lambda: self._controller_path(f"sites/{quote(site_id, safe='')}/{endpoint}")
+        if paginated:
+            return await self._get_all_pages(path, params=params)
+        return await self._get(path, params=params)
 
     _RETRYABLE_STATUS_CODES = {502, 503, 504}
     _MAX_RETRIES = 2
@@ -233,10 +286,8 @@ class OmadaClient:
         return await self._get(lambda: self._controller_path("settings/system/status"))
 
     async def get_sites(self) -> dict[str, Any]:
-        return await self._get(
-            lambda: self._controller_path("sites/basic"),
-            params={"currentPageSize": 100, "currentPage": 1},
-        )
+        sites = await self._get_all_pages(lambda: self._controller_path("sites/basic"))
+        return {"data": sites, "totalRows": len(sites)}
 
     async def get_capabilities(self) -> list[dict[str, Any]]:
         return await self._get(lambda: self._controller_path("capabilities"))
@@ -249,45 +300,109 @@ class OmadaClient:
 
     # ── Site-level endpoints ─────────────────────────────────────────
 
-    async def get_dashboard_overview(self) -> dict[str, Any]:
-        return await self._get(lambda: self._site_path("dashboard/overviewDiagram"))
+    async def get_dashboard_overview(self, site: str | None = None) -> dict[str, Any]:
+        return await self._read_site("dashboard/overviewDiagram", site)
 
-    async def get_wifi_channels(self) -> dict[str, Any]:
-        return await self._get(lambda: self._site_path("dashboard/channels"))
+    async def get_wifi_channels(self, site: str | None = None) -> dict[str, Any]:
+        return await self._read_site("dashboard/channels", site)
 
-    async def get_devices(self) -> list[dict[str, Any]]:
-        return await self._get_all_pages(lambda: self._site_path("grid/devices"))
+    async def get_devices(self, site: str | None = None) -> list[dict[str, Any]]:
+        return await self._read_site("grid/devices", site, paginated=True)
 
-    async def get_active_clients(self) -> list[dict[str, Any]]:
-        return await self._get_all_pages(
-            lambda: self._site_path("clients"),
+    async def get_active_clients(self, site: str | None = None) -> list[dict[str, Any]]:
+        return await self._read_site(
+            "clients", site, paginated=True,
             params={"filters.active": "true"},
         )
 
-    async def get_known_clients(self) -> list[dict[str, Any]]:
-        return await self._get_all_pages(lambda: self._site_path("insight/clients"))
+    async def get_known_clients(self, site: str | None = None) -> list[dict[str, Any]]:
+        return await self._read_site("insight/clients", site, paginated=True)
 
-    async def get_wlans(self) -> dict[str, Any]:
-        return await self._get(lambda: self._site_path("setting/wlans"))
+    async def get_wlans(self, site: str | None = None) -> dict[str, Any]:
+        return await self._read_site("setting/wlans", site)
 
-    async def get_ssids(self) -> dict[str, Any]:
-        return await self._get(lambda: self._site_path("setting/ssids"))
+    async def get_ssids(self, site: str | None = None) -> dict[str, Any]:
+        return await self._read_site("setting/ssids", site)
 
-    async def get_lan_networks(self) -> list[dict[str, Any]]:
-        return await self._get_all_pages(lambda: self._site_path("setting/lan/networks"))
+    async def get_lan_networks(self, site: str | None = None) -> list[dict[str, Any]]:
+        return await self._read_site("setting/lan/networks", site, paginated=True)
 
-    async def get_alerts(self, resolved: bool = False) -> list[dict[str, Any]]:
+    async def get_alerts(
+        self, resolved: bool | None = False, site: str | None = None,
+        start_ms: int | None = None, end_ms: int | None = None,
+    ) -> list[dict[str, Any]]:
+        params = self._time_filters(start_ms, end_ms)
+        if resolved is not None:
+            params["filters.resolved"] = str(resolved).lower()
+        return await self._read_site("logs/alerts", site, params=params, paginated=True)
+
+    @staticmethod
+    def _time_filters(start_ms: int | None, end_ms: int | None) -> dict:
         now_ms = int(time.time() * 1000)
         thirty_days_ms = 30 * 24 * 60 * 60 * 1000
-        return await self._get_all_pages(
-            lambda: self._site_path("logs/alerts"),
-            params={
-                "filters.resolved": str(resolved).lower(),
-                "filters.timeStart": now_ms - thirty_days_ms,
-                "filters.timeEnd": now_ms,
-            },
-            page_size=50,
+        end = now_ms if end_ms is None else end_ms
+        start = end - thirty_days_ms if start_ms is None else start_ms
+        if start < 0 or end < 0 or start >= end:
+            raise ValueError("Time range must satisfy 0 <= start_ms < end_ms (Unix milliseconds).")
+        return {"filters.timeStart": start, "filters.timeEnd": end}
+
+    async def get_events(
+        self, site: str | None = None,
+        start_ms: int | None = None, end_ms: int | None = None,
+    ) -> list[dict[str, Any]]:
+        return await self._read_site(
+            "logs/events", site, params=self._time_filters(start_ms, end_ms), paginated=True,
         )
+
+    async def get_site_resource(self, resource: str, site: str | None = None) -> Any:
+        if resource not in SITE_RESOURCES:
+            raise ValueError(f"Unknown resource {resource!r}. Choose from: {', '.join(SITE_RESOURCES)}")
+        endpoint, paginated = SITE_RESOURCES[resource]
+        return await self._read_site(endpoint, site, paginated=paginated)
+
+    async def get_topology(self, site: str | None = None) -> dict:
+        return await self._read_site("topology-v2", site)
+
+    @staticmethod
+    def _identity_matches(item: dict, query: str) -> bool:
+        def normalize(value: str) -> str:
+            return value.casefold().replace(":", "").replace("-", "").replace(".", "")
+        return any(
+            str(item.get(key, "")).casefold() == query.casefold()
+            for key in ("name", "hostName", "ip")
+        ) or (bool(item.get("mac")) and normalize(item["mac"]) == normalize(query))
+
+    async def _find_device(self, name_or_mac: str, site: str | None = None) -> dict:
+        matches = [d for d in await self.get_devices(site) if self._identity_matches(d, name_or_mac)]
+        if len(matches) != 1:
+            raise ValueError(f"Device {name_or_mac!r}: {len(matches)} matches. Use get_devices and select a MAC.")
+        return matches[0]
+
+    @staticmethod
+    def _device_endpoint(device: dict) -> str:
+        types = {"ap": "eaps", "switch": "switches", "gateway": "gateways"}
+        if device.get("type") not in types:
+            raise ValueError(f"Unsupported device type: {device.get('type')}")
+        return f"{types[device['type']]}/{quote(device['mac'], safe='')}"
+
+    async def get_device_detail(self, name_or_mac: str, site: str | None = None) -> dict:
+        device = await self._find_device(name_or_mac, site)
+        return await self._read_site(self._device_endpoint(device), site)
+
+    async def get_device_ports(self, name_or_mac: str, site: str | None = None) -> Any:
+        device = await self._find_device(name_or_mac, site)
+        return await self._read_site(f"{self._device_endpoint(device)}/ports", site)
+
+    async def get_client_detail(self, name_or_mac_or_ip: str, site: str | None = None) -> dict:
+        matches = [c for c in await self.get_active_clients(site)
+                   if self._identity_matches(c, name_or_mac_or_ip)]
+        if not matches:
+            matches = [c for c in await self.get_known_clients(site)
+                       if self._identity_matches(c, name_or_mac_or_ip)]
+        if len(matches) != 1:
+            raise ValueError(f"Client {name_or_mac_or_ip!r}: {len(matches)} matches. Select a MAC from the client lists.")
+        mac = quote(matches[0]["mac"], safe="")
+        return await self._read_site(f"clients/{mac}", site)
 
     async def close(self) -> None:
         await self._http.aclose()

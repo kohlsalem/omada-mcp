@@ -1,6 +1,7 @@
 """Tests for server-side formatting functions and tools."""
 
 import base64
+import json
 
 import pytest
 from unittest.mock import AsyncMock, patch
@@ -62,8 +63,9 @@ async def test_device_detail_by_name():
     ]
 
     with patch("omada_mcp.server._get_client") as mock:
-        mock.return_value.get_devices = AsyncMock(return_value=devices)
+        mock.return_value.get_device_detail = AsyncMock(return_value=devices[0])
         result = await get_device_detail("ap-office")
+        mock.return_value.get_device_detail.assert_awaited_once_with("ap-office", None)
 
     assert "AP-Office" in result
     assert "EAP620" in result
@@ -82,7 +84,7 @@ async def test_device_detail_by_mac():
     ]
 
     with patch("omada_mcp.server._get_client") as mock:
-        mock.return_value.get_devices = AsyncMock(return_value=devices)
+        mock.return_value.get_device_detail = AsyncMock(return_value=devices[0])
         result = await get_device_detail("aa:bb:cc:dd:ee:ff")
 
     assert "Switch1" in result
@@ -90,12 +92,27 @@ async def test_device_detail_by_mac():
 
 @pytest.mark.asyncio
 async def test_device_detail_not_found():
-    """Should return 'not found' message for unknown device."""
+    """Lookup failures should reach the MCP error handler, not look like empty data."""
     with patch("omada_mcp.server._get_client") as mock:
-        mock.return_value.get_devices = AsyncMock(return_value=[])
-        result = await get_device_detail("nonexistent")
+        mock.return_value.get_device_detail = AsyncMock(side_effect=ValueError("Device not found"))
+        with pytest.raises(ValueError, match="not found"):
+            await get_device_detail("nonexistent")
 
-    assert "not found" in result.lower()
+
+@pytest.mark.asyncio
+async def test_resource_discovery_and_site_forwarding():
+    from omada_mcp.server import list_read_resources, read_site_resource, mcp
+
+    resources = json.loads(await list_read_resources())
+    assert resources["gateway_acls"]["paginated"] is True
+    with patch("omada_mcp.server._get_client") as mock:
+        mock.return_value.get_site_resource = AsyncMock(return_value=[{"vlan": 10}])
+        result = await read_site_resource("port_profiles", "Branch")
+        mock.return_value.get_site_resource.assert_awaited_once_with("port_profiles", "Branch")
+        assert json.loads(result) == [{"vlan": 10}]
+    tools = {t.name: t for t in await mcp.list_tools()}
+    assert tools["read_site_resource"].annotations.readOnlyHint is True
+    assert "site" in tools["get_device_detail"].inputSchema["properties"]
 
 
 # ── check_connection tool ───────────────────────────────────────────
