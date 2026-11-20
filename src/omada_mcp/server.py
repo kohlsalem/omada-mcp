@@ -93,6 +93,7 @@ mcp = FastMCP(
         "Site-aware tools accept a site name or ID; omit it for the configured default."
     ),
     lifespan=_lifespan,
+    host=os.environ.get("MCP_HOST", "0.0.0.0"),
 )
 
 
