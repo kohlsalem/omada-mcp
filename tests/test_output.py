@@ -73,3 +73,33 @@ def test_ssid_and_wan_annotations_are_not_effective_status_claims():
     assert result["pskSetting"]["versionPskText"] == "WPA2-PSK"
     assert "not measured" in result["onlineDetectionNote"]
     assert "placeholders" in result["ssidOverridesNote"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("group", [None, "servers"])
+async def test_vpn_configs_serializes_numeric_enum_keys(group):
+    from omada_mcp.client import VPN_TYPES
+    from omada_mcp.server import get_vpn_configs
+
+    with patch("omada_mcp.server._get_client") as factory:
+        factory.return_value.get_vpn_configs = AsyncMock(return_value={"groups": {}, "vpn_types": VPN_TYPES})
+        result = json.loads(await get_vpn_configs(group=group))
+        assert result["vpn_types"]["2"] == "IPsec"
+        assert result["vpn_types"]["4"] == "WireGuard"
+
+
+def test_portal_privacy_keeps_other_resource_ids_usable():
+    from omada_mcp.output import mask_portal_metadata
+
+    data = {"site": "site-ref", "omadacId": "controller-ref", "sms": {"phoneNumber": "+1234", "phoneNum": "+5678"}, "id": "portal-ref"}
+    masked = mask_portal_metadata(data)
+    assert masked["site"] == "[REDACTED]"
+    assert masked["sms"]["phoneNumber"] == "[REDACTED]"
+    assert masked["sms"]["phoneNum"] == "[REDACTED]"
+    assert masked["id"] == "portal-ref"
+    assert prepare_output(data)["site"] == "site-ref"
+
+
+def test_psk4_label_is_definite_and_six_ghz_is_sae_only():
+    assert prepare_output({"versionPsk": 4})["versionPskText"] == "WPA2-PSK/WPA3-SAE transition mode"
+    assert prepare_output({"band": 4, "pskSetting": {"versionPsk": 4}})["pskSetting"]["versionPskText"] == "WPA3-SAE"

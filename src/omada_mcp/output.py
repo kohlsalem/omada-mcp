@@ -16,8 +16,8 @@ SECRET_NAMES = {
 }
 
 
-def _secret_key(key: str) -> bool:
-    name = re.sub(r"[^a-z0-9]", "", key.lower())
+def _secret_key(key) -> bool:
+    name = re.sub(r"[^a-z0-9]", "", str(key).lower())
     # Event 'key' is an identifier, handled separately by the caller below.
     return name in SECRET_NAMES or any(
         term in name for term in ("password", "passwd", "passphrase", "privatekey", "presharedkey",
@@ -74,7 +74,11 @@ def prepare_output(data, include_secrets: bool = False):
                                    if data["band"] & bit]
     if "versionPsk" in data:
         result["versionPskText"] = {1: "WPA-PSK", 2: "WPA2-PSK", 3: "WPA/WPA2-PSK",
-                                    4: "WPA2-PSK/WPA3-SAE (band/mode dependent)"}.get(data["versionPsk"], "unknown")
+                                    4: "WPA2-PSK/WPA3-SAE transition mode"}.get(data["versionPsk"], "unknown")
+    if isinstance(result.get("pskSetting"), dict) and data["pskSetting"].get("versionPsk") == 4:
+        result["pskSetting"]["versionPskText"] = (
+            "WPA3-SAE" if data.get("band") == 4 else "WPA2-PSK/WPA3-SAE transition mode"
+        )
     # Audit old/new strings can contain credentials without structured keys. Do not
     # expose those opaque blobs by default; action/operator/result remain readable.
     if not include_secrets and "auditType" in data:
@@ -82,3 +86,15 @@ def prepare_output(data, include_secrets: bool = False):
             if data.get(field):
                 result[field] = "[REDACTED]"
     return result
+
+
+def mask_portal_metadata(data):
+    """Privacy fields in portal configuration, without breaking IDs in other tools."""
+    if isinstance(data, list):
+        return [mask_portal_metadata(x) for x in data]
+    if not isinstance(data, dict):
+        return data
+    private = {"site", "siteid", "omadacid", "phone", "phonenum", "phonenumber", "from", "fromnumber",
+               "tonumber", "telephone", "mobilenumber", "twiliophone", "sendernumber"}
+    return {k: "[REDACTED]" if str(k).lower() in private and v not in (None, "")
+            else mask_portal_metadata(v) for k, v in data.items()}

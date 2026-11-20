@@ -15,7 +15,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from omada_mcp.client import OmadaClient, SITE_RESOURCES, REPORT_CARDS, OPENAPI_RESOURCES, CONTROLLER_RESOURCES
-from omada_mcp.output import prepare_output
+from omada_mcp.output import prepare_output, mask_portal_metadata
 
 # Logging to stderr only (stdout is JSON-RPC)
 logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(levelname)s %(name)s: %(message)s")
@@ -461,6 +461,8 @@ async def list_read_resources() -> str:
     resources["vpn_users"] = {"endpoint": "vpn/users", "api": "openapi/v2", "paginated": True}
     for name in ("url_filters", "ap_url_filters"):
         resources[name]["params"] = {"type": "gateway" if name == "url_filters" else "ap"}
+    for name in ("rogue_aps", "reboot_schedules", "upgrade_schedules"):
+        resources[name]["status_tool"] = "get_resource_status"
     return _json(resources)
 
 
@@ -482,8 +484,22 @@ async def read_site_resource(resource: str, site: str | None = None, include_sec
     WLAN/RRM, security, services, schedules and remote logging included).
     Secrets are masked unless include_secrets=true. WAN onlineDetection describes
     configured probes, not measured health; inspect overview WAN status separately.
+    For rogue_aps/reboot_schedules/upgrade_schedules, use get_resource_status to
+    distinguish an empty readable table from denied access/unknown activation.
     """
-    return _json(await _get_client().get_site_resource(resource, site), include_secrets)
+    data = await _get_client().get_site_resource(resource, site)
+    if resource == "portals" and not include_secrets:
+        data = mask_portal_metadata(data)
+    return _json(data, include_secrets)
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
+async def get_resource_status(resource: str, site: str | None = None) -> str:
+    """Read rogue_aps/reboot_schedules/upgrade_schedules with explicit read/permission,
+    record count and activation status. Unknown activation is null, never inferred
+    from an empty list. supported refers to API read support, not radio capability.
+    """
+    return _json(await _get_client().get_resource_status(resource, site))
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
@@ -519,15 +535,17 @@ async def get_ssid_detail(name_or_id: str, site: str | None = None, include_secr
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
-async def get_acl_rules(kind: str = "gateway", site: str | None = None) -> str:
+async def get_acl_rules(kind: str = "gateway", site: str | None = None, expand_objects: bool = False) -> str:
     """Read gateway/switch/ap ACLs with network, IP/IP-port/MAC group, SSID and time-profile resolution.
 
     Adds source/destination type names and negation (e.g. 11=not_network), syslog
     configuration and hit-counter availability, preserving raw rule fields. Switch
     device/port binding selections are included. Unsupported counters are unknown,
     never zero. Resolution errors are reported separately from empty object lists.
+    Resolved objects contain only names/IDs by default. expand_objects=true includes
+    full referenced objects (potentially large, e.g. repeated DHCP configuration).
     """
-    return _json(await _get_client().get_acl_rules(kind, site))
+    return _json(await _get_client().get_acl_rules(kind, site, expand_objects))
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})

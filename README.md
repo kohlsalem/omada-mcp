@@ -100,6 +100,7 @@ Environment variables for HTTP mode:
 | `get_rf_scan` | Existing AP RF scan results/status; never starts a scan |
 | `list_controller_resources` | Discover controller-level read sections |
 | `read_controller_resource` | Controller settings/certificate metadata, NTP, cloud, accounts/roles/MFA, auto-backup |
+| `get_resource_status` | Rogue AP/schedule rows plus explicit API access, permission, count and unknown activation status |
 
 ### Secret masking and output annotations
 
@@ -112,6 +113,9 @@ are intended for internal processing, not direct display.
 Only explicit `include_secrets=true` on `get_device_detail`, `get_ssid_detail`,
 `get_vpn_detail`, `read_site_resource` or `read_controller_resource` opts that one
 call into plaintext values returned by Omada. This never changes later calls.
+Portal outputs also mask SMS/Twilio phone numbers and redundant site/controller
+identifiers. IDs in other resources remain usable for lookups. Numeric dictionary
+keys (e.g. the VPN type map) are supported by the masking layer.
 
 Port `linkSpeed`/`maxSpeed` codes are preserved with additional `*Mbps`/`*Text`
 fields (1=10M, 2=100M, 3=1G, 4=2.5G, 5=10G, 6=5G, 7=25G, 8=100G, 9=40G).
@@ -122,6 +126,24 @@ SSID responses add security-family, PMF and band labels. Detailed PSK mode depen
 on `versionPsk`, band and mode. Raw enum values are retained. AP `ssidOverrides`
 can contain placeholders, so use `get_ssid_detail` for configured SSID values.
 WAN `onlineDetection` describes configured probes, not measured health.
+PSK mode 4 is labelled WPA2-PSK/WPA3-SAE transition mode; an explicitly 6-GHz-only
+SSID is labelled WPA3-SAE.
+
+### Parallel calls and empty resources
+
+Controller requests are limited to four in flight per server client. Concurrent
+cold calls share one login; HTML session-expiry recovery is serialized too.
+Twelve simultaneous reader calls including `ssid_details` completed in a live
+check. The reported client message “may not have run” remains unconfirmed as a
+server/transport fault; a client can also omit scheduling calls. This check covers
+the server readers, not every external MCP client's orchestration or timeouts.
+
+`get_resource_status("rogue_aps"|"reboot_schedules"|"upgrade_schedules")` returns
+`data` and `status` rather than a bare list. It reports observed permission/API
+read support and record count. Activation is `null` when the endpoint does not
+report it. No rogue detections is not proof that detection is enabled; no schedule
+records means no configured schedules. Existing resource readers retain their
+list response for compatibility; the catalog points to the status tool.
 
 ### Bounded event queries (response-shape change)
 
@@ -264,6 +286,9 @@ unsupported/missing hit counters from zero hits. Type 11 is **NOT network**, not
 "all destinations". Switch bindings decode 0=all ports, 1=custom ports,
 2=all switches, 3=custom switches. Candidate inventory ports and explicit custom
 selections are separate. Unresolved references and lookup errors remain visible.
+Resolved objects contain **only names and IDs by default**, avoiding repeated LAN
+DHCP settings per rule. `expand_objects=true` opts into full referenced objects.
+The verified 14-rule gateway response shrank from about 118,000 to 28,000 characters.
 
 Detail/resource/topology/event tools return JSON preserving controller field names;
 existing inventory tools return concise summaries. API enum values are preserved.

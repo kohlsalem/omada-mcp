@@ -200,3 +200,25 @@ class TestLiveController:
             if device["type"] == "ap":
                 assert isinstance(await client.get_rf_scan(device["mac"]), (dict, list))
                 break
+
+    async def test_vpn_output_compact_acl_status_and_parallel_readers(self, client):
+        import asyncio
+        import json
+        from omada_mcp.server import _json
+
+        resources = ["wan", "ssid_details", "ip_groups", "ip_port_groups", "port_profiles",
+                     "ips_settings", "upnp", "mdns", "ddns", "reboot_schedules",
+                     "upgrade_schedules", "rogue_aps"]
+        results = await asyncio.gather(*(client.get_site_resource(r) for r in resources))
+        assert len(results) == 12
+        for group in (None, "servers"):
+            data = json.loads(_json(await client.get_vpn_configs(group=group)))
+            assert data["vpn_types"]["2"] == "IPsec"
+        compact = await client.get_acl_rules()
+        assert all(set(obj["value"]) <= {"id", "groupId", "ssidId", "name", "ssidName"}
+                   for rule in compact["data"] for side in ("sourceResolved", "destinationResolved")
+                   for obj in rule[side]["objects"] if obj["value"] is not None)
+        for resource in ("rogue_aps", "reboot_schedules", "upgrade_schedules"):
+            result = await client.get_resource_status(resource)
+            assert result["status"]["readable"] is True
+            assert result["status"]["record_count"] == len(result["data"])

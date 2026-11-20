@@ -152,6 +152,8 @@ class OmadaClient:
         self._csrf_token: str = ""
         self._omadac_id: str = ""
         self._site_id: str = ""
+        self._auth_lock = asyncio.Lock()
+        self._request_slots = asyncio.Semaphore(4)
 
     @staticmethod
     def _raise_for_status(resp: httpx.Response) -> None:
@@ -213,7 +215,9 @@ class OmadaClient:
     async def _ensure_auth(self) -> None:
         """Login if not already authenticated."""
         if not self._authenticated:
-            await self._login()
+            async with self._auth_lock:
+                if not self._authenticated:
+                    await self._login()
 
     def _controller_path(self, endpoint: str) -> str:
         """Build a controller-level API path."""
@@ -260,7 +264,8 @@ class OmadaClient:
         last_exc: Exception | None = None
         for attempt in range(self._MAX_RETRIES + 1):
             try:
-                resp = await self._http.request(method, path, params=params, json=json)
+                async with self._request_slots:
+                    resp = await self._http.request(method, path, params=params, json=json)
                 if resp.status_code in self._RETRYABLE_STATUS_CODES and attempt < self._MAX_RETRIES:
                     delay = self._RETRY_BASE_DELAY * (2 ** attempt)
                     logger.warning("HTTP %d on %s %s, retrying in %.1fs...", resp.status_code, method, path, delay)
@@ -286,18 +291,20 @@ class OmadaClient:
         already populated when the path is built.
         """
         await self._ensure_auth()
-        if callable(path):
-            path = path()
-        resp = await self._request_with_retry("GET", path, params=params)
+        build_path = path if callable(path) else lambda: path
+        token = self._csrf_token
+        resp = await self._request_with_retry("GET", build_path(), params=params)
         self._raise_for_status(resp)
 
         # Detect HTML response (session expired)
         content_type = resp.headers.get("content-type", "")
         if "text/html" in content_type:
             logger.warning("Session expired, re-authenticating...")
-            self._authenticated = False
-            await self._login()
-            resp = await self._request_with_retry("GET", path, params=params)
+            async with self._auth_lock:
+                if self._csrf_token == token:
+                    self._authenticated = False
+                    await self._login()
+            resp = await self._request_with_retry("GET", build_path(), params=params)
             self._raise_for_status(resp)
 
         data = resp.json()
@@ -310,14 +317,17 @@ class OmadaClient:
         await self._ensure_auth()
         build_path = path if callable(path) else lambda: path
         request_path = build_path()
+        token = self._csrf_token
         resp = await self._request_with_retry("POST", request_path, json=json)
         self._raise_for_status(resp)
 
         content_type = resp.headers.get("content-type", "")
         if "text/html" in content_type:
             logger.warning("Session expired, re-authenticating...")
-            self._authenticated = False
-            await self._login()
+            async with self._auth_lock:
+                if self._csrf_token == token:
+                    self._authenticated = False
+                    await self._login()
             resp = await self._request_with_retry("POST", build_path(), json=json)
             self._raise_for_status(resp)
 
@@ -525,7 +535,24 @@ class OmadaClient:
             params = {"type": "gateway" if resource == "url_filters" else "ap"}
         return await self._read_site(endpoint, site, params=params, paginated=paginated)
 
-    async def get_acl_rules(self, kind: str = "gateway", site: str | None = None) -> dict:
+    async def get_resource_status(self, resource: str, site: str | None = None) -> dict:
+        """Report observed read access without inferring activation from empty rows."""
+        if resource not in ("rogue_aps", "reboot_schedules", "upgrade_schedules"):
+            raise ValueError("Status resource must be rogue_aps, reboot_schedules or upgrade_schedules")
+        try:
+            data = await self.get_site_resource(resource, site)
+        except OmadaApiError as exc:
+            return {"data": None, "status": {"readable": False, "supported": False if exc.error_code == -1600 else None,
+                    "permission": "denied" if exc.error_code == -1007 else "unknown", "enabled": None,
+                    "error": str(exc)}}
+        enabled = [row.get("enable", row.get("enabled", row.get("status"))) for row in data]
+        return {"data": data, "status": {"readable": True, "permission": "allowed", "supported": True,
+                "enabled": None, "record_count": len(data), "record_enable_values": enabled,
+                "interpretation": "No configured schedules" if not data and resource != "rogue_aps" else
+                "No returned detections; detection activation is unknown" if not data else "Records returned",
+                "note": "API read support does not establish hardware detection support or activation."}}
+
+    async def get_acl_rules(self, kind: str = "gateway", site: str | None = None, expand_objects: bool = False) -> dict:
         if kind not in ("gateway", "switch", "ap"):
             raise ValueError("kind must be gateway, switch or ap")
         typ = {"gateway": 0, "switch": 1, "ap": 2}[kind]
@@ -576,6 +603,10 @@ class OmadaClient:
                       8: "country", 9: "country_group", 10: "domain_port_group",
                       11: "not_network", 12: "not_ip_group", 13: "not_ip_port_group",
                       14: "not_ipv6_group", 15: "not_ipv6_port_group", 24: "domain_group"}
+        def compact(obj):
+            if obj is None or expand_objects:
+                return obj
+            return {k: obj[k] for k in ("id", "groupId", "ssidId", "name", "ssidName") if k in obj}
         for rule in rules:
             rule["policyText"] = {0: "deny", 1: "permit"}.get(rule.get("policy"), "unknown")
             for side in ("source", "destination"):
@@ -585,9 +616,9 @@ class OmadaClient:
                 rule[f"{side}Resolved"] = {
                     "type": type_names.get(code, "unknown"), "negated": code in (11, 12, 13, 14, 15),
                     "objects": [{"id": ref, "resolved": ref in indexes.get(base, {}),
-                                 "value": indexes.get(base, {}).get(ref)} for ref in refs],
+                                 "value": compact(indexes.get(base, {}).get(ref))} for ref in refs],
                 }
-            rule["timeProfileResolved"] = profiles.get(rule.get("timeRangeId"))
+            rule["timeProfileResolved"] = compact(profiles.get(rule.get("timeRangeId")))
             rule["syslogStatus"] = {"configured": rule.get("syslog"), "available": "syslog" in rule}
             rule["hitCounterStatus"] = {
                 "supported": first.get("supportHitCount"),
@@ -599,10 +630,10 @@ class OmadaClient:
                 rule["bindingResolved"] = {
                     "bindingType": rule.get("bindingType"),
                     "bindingTypeText": {0: "all_ports", 1: "custom_ports", 2: "all_switches", 3: "custom_switches"}.get(rule.get("bindingType"), "unknown"),
-                    "devices": [{"raw": d, "device": device_index.get(d) if isinstance(d, str) else None}
+                    "devices": [{"raw": d, "device": compact(device_index.get(d)) if isinstance(d, str) else None}
                                 for d in bound],
                     "ports": rule.get("customAclPorts", []),
-                    "network": indexes[0].get(rule.get("networkId")),
+                    "network": compact(indexes[0].get(rule.get("networkId"))),
                     "inventoryPorts": [{"switchMac": mac, "switchName": device_index.get(mac, {}).get("name"),
                                         "ports": [{"port": p.get("port"), "name": p.get("name"), "id": p.get("id")}
                                                   for p in ports]}

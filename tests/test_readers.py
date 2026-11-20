@@ -379,6 +379,61 @@ async def test_acl_resolves_negation_groups_and_reports_missing_counters(client)
     rule = (await client.get_acl_rules())["data"][0]
     assert rule["sourceResolved"]["objects"][0]["value"]["name"] == "PC"
     assert rule["destinationResolved"]["negated"] is True
-    assert rule["destinationResolved"]["objects"][0]["value"]["vlan"] == 20
+    assert rule["destinationResolved"]["objects"][0]["value"] == {"id": "net1", "name": "IoT"}
+    expanded = (await client.get_acl_rules(expand_objects=True))["data"][0]
+    assert expanded["destinationResolved"]["objects"][0]["value"]["vlan"] == 20
     assert rule["syslogStatus"]["configured"] is True
     assert rule["hitCounterStatus"] == {"supported": False, "value": None, "available": False}
+
+
+@pytest.mark.asyncio
+async def test_twelve_cold_reads_share_login_and_limit_inflight_requests(client):
+    from unittest.mock import AsyncMock, patch
+
+    client._authenticated = False
+    gate = asyncio.Event()
+    inflight = 0
+    maximum = 0
+    reached_four = asyncio.Event()
+
+    async def login():
+        await asyncio.sleep(0)
+        client._authenticated = True
+
+    async def handler(request):
+        nonlocal inflight, maximum
+        inflight += 1
+        maximum = max(maximum, inflight)
+        if inflight == 4:
+            reached_four.set()
+        await gate.wait()
+        inflight -= 1
+        return respond({"enable": True})
+
+    client._http = httpx.AsyncClient(base_url=client.base_url, transport=httpx.MockTransport(handler))
+    with patch.object(client, "_login", new_callable=AsyncMock, side_effect=login) as auth:
+        tasks = [asyncio.create_task(client.get_site_resource("upnp")) for _ in range(12)]
+        try:
+            await asyncio.wait_for(reached_four.wait(), 2)
+        finally:
+            gate.set()
+        results = await asyncio.gather(*tasks)
+        assert len(results) == 12
+        assert maximum == 4
+        auth.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_empty_resource_status_never_infers_activation(client):
+    def handler(request):
+        if request.url.path.endswith("rebootSchedules"):
+            return httpx.Response(200, json={"errorCode": -1007, "msg": "Denied"})
+        return respond({"data": [], "totalRows": 0})
+
+    client._http = httpx.AsyncClient(base_url=client.base_url, transport=httpx.MockTransport(handler))
+    rogue = await client.get_resource_status("rogue_aps")
+    assert rogue["status"]["enabled"] is None
+    assert rogue["status"]["permission"] == "allowed"
+    denied = await client.get_resource_status("reboot_schedules")
+    assert denied["data"] is None
+    assert denied["status"]["permission"] == "denied"
