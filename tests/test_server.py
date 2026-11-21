@@ -14,6 +14,23 @@ from starlette.routing import Route
 from omada_mcp.server import _fmt_bytes, get_device_detail, check_connection, BasicAuthMiddleware
 
 
+@pytest.mark.asyncio
+async def test_alert_formatter_uses_controller_v2_fields():
+    from omada_mcp.server import get_alerts
+
+    alert = {"key": "WAN_ONLINE_DETECTION", "content": "WAN2 detection was offline.",
+             "time": 1794962382000, "level": "Information", "resolved": False,
+             "device": {"name": "Router Keller"}}
+    with patch("omada_mcp.server._get_client") as factory:
+        factory.return_value.get_alerts = AsyncMock(return_value=[alert])
+        result = await get_alerts()
+    assert "WAN2 detection was offline." in result
+    assert "Type: WAN_ONLINE_DETECTION" in result
+    assert "Time: 2026-11-" in result and "+00:00" in result
+    assert "Router Keller" in result
+    assert "Type: ?" not in result and "Time: ?" not in result
+
+
 # ── _fmt_bytes ──────────────────────────────────────────────────────
 
 

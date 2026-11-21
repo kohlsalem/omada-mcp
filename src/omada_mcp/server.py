@@ -7,6 +7,7 @@ import os
 import secrets
 import sys
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 import uvicorn
 from mcp.server.fastmcp import FastMCP
@@ -435,12 +436,22 @@ async def get_alerts(
 
     lines = [f"Alerts ({len(alerts)}):"]
     for a in alerts:
+        timestamp = a.get("time", a.get("timestamp"))
+        if isinstance(timestamp, (int, float)):
+            # Omada v2 time is Unix milliseconds; legacy timestamp may be seconds.
+            seconds = timestamp / 1000 if "time" in a or timestamp > 100_000_000_000 else timestamp
+            try:
+                timestamp = datetime.fromtimestamp(seconds, timezone.utc).isoformat()
+            except (ValueError, OverflowError, OSError):
+                timestamp = str(timestamp)
+        device = a.get("device") or {}
         lines.append(
-            f"  [{a.get('level', '?').upper()}] {a.get('msg', a.get('message', '?'))}\n"
-            f"    Type: {a.get('type', '?')}  Time: {a.get('timestamp', '?')}"
+            f"  [{str(a.get('level') or 'unknown').upper()}] {a.get('content') or a.get('msg') or a.get('message') or 'No message provided'}\n"
+            f"    Type: {a.get('key') or a.get('type') or 'unknown'}  Time: {timestamp if timestamp is not None else 'unknown'}\n"
+            f"    Device: {device.get('name') or device.get('mac') or 'N/A'}  Resolved: {a.get('resolved', 'unknown')}"
         )
 
-    return "\n".join(lines)
+    return prepare_output("\n".join(lines))
 
 
 # Detailed readers preserve controller fields rather than guessing model-specific schemas.
